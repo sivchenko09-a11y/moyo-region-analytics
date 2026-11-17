@@ -2433,8 +2433,8 @@ def interim_dashboard(report_day, slot, rate, data):
         txt(43,y+13,short.get(store,store),21,navy,True)
         for k,xp,xf,xe,xs in (('sales',380,500,556,None),('accessories',786,905,973,1160),('services',1280,1390,1458,1650)):
             pp=perf(vals[k],plan[k]); share=100*vals[k]/vals['sales'] if vals['sales'] else 0
-            txt(xp,y+14,money(plan[k]) if plan[k] is not None else '—',19,navy,True,'ra')
-            txt(xf,y+14,money(vals[k]),20,navy,True,'ra')
+            txt(xp,y+14,money(plan[k]) if plan[k] is not None else '—',19,muted,False,'ra')
+            txt(xf,y+12,money(vals[k]),23,navy,True,'ra')
             if pp is not None:
                 badge_x=xe
                 rect(badge_x,y+8,badge_x+90,y+44,
@@ -2451,7 +2451,7 @@ def interim_dashboard(report_day, slot, rate, data):
         if xs is not None: txt(xs,yy+13,f'{100*totals[k]/totals["sales"] if totals["sales"] else 0:.1f}%',19,'white',True,'ra')
     rect(14,1522,837,1816,'white',20); rect(851,1522,1686,1816,'white',20)
     rect(30,1539,822,1598,'#dcf6e9',13); rect(866,1539,1670,1598,'#fbe5e8',13)
-    d.polygon([(52,1565),(64,1553),(64,1560),(79,1560),(79,1570),(64,1570),(64,1577)],fill='#07854e')
+    d.polygon([(66,1548),(49,1567),(59,1567),(59,1582),(73,1582),(73,1567),(83,1567)],fill='#07854e')
     txt(94,1551,'ТОП-3  •  ОБОРОТ',29,'#07854e',True)
     txt(885,1551,'↓ АНТИТОП-3  •  ОБОРОТ',29,'#c82e43',True)
     ranking=[(store,perf(vals['sales'],plan['sales']),vals['sales']) for store,vals,plan in results]
@@ -2466,9 +2466,8 @@ def interim_dashboard(report_day, slot, rate, data):
                 y=1620+i*60
                 txt(x,y,f'{i+1}. {short.get(store,store)}',20,navy,True)
                 txt(x+530,y,pct(pc),21,color(pc),True)
-                txt(x+745,y,money(actual)+' ₴',17,muted,False,'ra')
+                txt(x+745,y,money(actual)+' ₴',21,navy,True,'ra')
                 if i<2: d.line((x,y+46,x+765,y+46),fill='#e5edf6',width=2)
-    txt(26,1844,'Дані 1С  •  Плани в грн за обліковим курсом  •  Повернення враховано в обороті',18,muted)
     from PIL import ImageEnhance, ImageFilter
     im=ImageEnhance.Contrast(im).enhance(1.07)
     im=im.filter(ImageFilter.UnsharpMask(radius=1.2,percent=145,threshold=2))
