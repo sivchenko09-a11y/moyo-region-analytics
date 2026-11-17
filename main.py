@@ -548,6 +548,44 @@ def quality_summary(frame):
             "КТЧ ≈": totals.estimated_items / totals.receipts if totals.receipts else None}
 
 
+def daily_plan_lines(frame, report_day, plans):
+    days = calendar.monthrange(report_day.year, report_day.month)[1]
+    lines = ["ПЛАН / ФАКТ ЗА ДЕНЬ", f"Денний план = місячний план ÷ {days}."]
+    for metric, label in (("sales", "Оборот"), ("accessories", "Аксесуари"), ("services", "Послуги")):
+        values, missing = [], []
+        for _, row in frame.iterrows():
+            value = plans.loc[row.store, metric] if row.store in plans.index else None
+            if (value is None or pd.isna(value)) and metric == "sales":
+                value = row.get("plan")
+            if value is None or pd.isna(value):
+                missing.append(row.store)
+            else:
+                values.append(float(value))
+        daily_target = sum(values) / days if not missing else None
+        if frame[metric].isna().any():
+            target_text = f"план {fmt(daily_target)}; " if daily_target is not None else ""
+            lines.append(f"⚪ {label}: {target_text}факт і виконання не визначені — потрібен звіт за {report_day-timedelta(days=1):%d.%m.%Y} для всіх магазинів.")
+            continue
+        actual = frame[metric].sum()
+        if missing:
+            lines.append(f"⚪ {label}: факт {fmt(actual)}; немає місячного плану для: " + ", ".join(missing))
+            continue
+        if daily_target <= 0:
+            lines.append(f"⚪ {label}: план {fmt(daily_target)} / факт {fmt(actual)}; виконання у % не визначається за нульового плану.")
+            continue
+        fulfillment = actual / daily_target * 100
+        difference = actual - daily_target
+        if difference < -1e-9:
+            status, icon = f"недовиконання {fmt(-difference)}", "🔴"
+        elif difference > 1e-9:
+            status, icon = f"перевиконання {fmt(difference)}", "🟢"
+        else:
+            status, icon = "план виконано", "🟢"
+        lines.append(f"{icon} {label}: план {fmt(daily_target)} / факт {fmt(actual)}; виконання {fulfillment:.2f}%; {status}.")
+    return lines
+
+
+
 def daily_summary(frames, store=None):
     latest = max(frames)
     end = datetime.strptime(latest, "%Y-%m-%d").date()
@@ -557,14 +595,17 @@ def daily_summary(frames, store=None):
     if day.empty:
         raise ValueError("Магазин відсутній в останньому звіті.")
     lines = [f"📊 {store or 'РЕГІОН'} — {latest}", "ЗА ДЕНЬ"]
-    for metric, label in WEEK_METRICS.items():
+    plans = load_monthly_plans(latest[:7])
+    lines.extend(daily_plan_lines(day, end, plans))
+    lines.extend(["", "Інші показники за день:"])
+    for metric, label in (("direct", "Прямі"), ("pickup", "Пікап")):
         if day[metric].isna().any():
             lines.append(f"• {label}: потрібен звіт за {end-timedelta(days=1):%d.%m.%Y}")
         else:
             lines.append(f"• {label}: {fmt(day[metric].sum())}")
     for label, value in quality_summary(day).items():
         lines.append(f"• {label}: {value:.2f}" if value is not None else f"• {label}: немає бази")
-    lines.extend(monthly_trend_lines(frames, store))
+    lines.extend(monthly_trend_lines(frames, store, plans))
     return "\n".join(lines)
 
 
