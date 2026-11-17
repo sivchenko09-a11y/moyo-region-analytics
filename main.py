@@ -1,4 +1,5 @@
 import os
+import math
 import asyncio
 import json
 from types import SimpleNamespace
@@ -400,6 +401,16 @@ def weekly_report(end, store=None):
         actions = decline_actions(values[0], values[1], end, include_quality=False)
         if actions:
             lines.extend(["", f"План дій — {name}", "Цілі: повернення до рівня попереднього тижня.", *actions])
+    conn = db()
+    try:
+        last = conn.execute("SELECT MAX(report_date) FROM snapshots").fetchone()[0]
+    finally:
+        conn.close()
+    if last:
+        latest_frame = get_snapshot(last)
+        for metric in PLAN_COLUMNS:
+            latest_frame["cumulative_" + metric] = latest_frame[metric]
+        lines.extend(monthly_trend_lines({last: latest_frame}, store))
     return "\n".join(lines)
 
 
@@ -667,6 +678,103 @@ async def weeks_selected(update, context):
 
 
 
+PLAN_COLUMNS = {"sales": "План обороту", "accessories": "План аксесуарів", "services": "План послуг"}
+
+
+def parse_monthly_plans(frame):
+    required = ["Місяць", "Склад", *PLAN_COLUMNS.values()]
+    if any(column not in frame.columns for column in required):
+        raise ValueError("Вкладка Плани: потрібні колонки " + ", ".join(required))
+    records, seen = [], set()
+    for _, row in frame.iterrows():
+        if all(pd.isna(row[c]) or str(row[c]).strip() == "" for c in required):
+            continue
+        name = str(row["Склад"]).strip() if pd.notna(row["Склад"]) else ""
+        month = str(row["Місяць"]).strip()
+        try:
+            month = datetime.strptime(month, "%m.%Y").strftime("%Y-%m")
+        except ValueError:
+            raise ValueError(f"Вкладка Плани: місяць для {name or 'рядка'} має бути текстом ММ.РРРР, наприклад 11.2026.")
+        if not name:
+            raise ValueError("Вкладка Плани: заповни Склад.")
+        if (month, name) in seen:
+            raise ValueError(f"Вкладка Плани: повтор магазину {name} за {month}.")
+        seen.add((month, name))
+        values = []
+        for column in PLAN_COLUMNS.values():
+            raw = row[column]
+            if pd.isna(raw) or str(raw).strip() == "":
+                values.append(None)
+                continue
+            try:
+                value = float(re.sub(r"\s+", "", str(raw)).replace(",", "."))
+            except ValueError:
+                raise ValueError(f"Вкладка Плани: {name}, {column} — потрібне число в доларах.")
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"Вкладка Плани: {name}, {column} — план має бути невід’ємним числом.")
+            values.append(value)
+        records.append((month, name, *values))
+    return records
+
+
+def monthly_plans_db(conn):
+    conn.execute("CREATE TABLE IF NOT EXISTS monthly_plans (month TEXT, store TEXT, sales REAL, accessories REAL, services REAL, PRIMARY KEY(month, store))")
+
+
+def load_monthly_plans(month):
+    conn = db()
+    try:
+        monthly_plans_db(conn)
+        return pd.read_sql_query("SELECT * FROM monthly_plans WHERE month = ?", conn, params=(month,)).set_index("store")
+    finally:
+        conn.close()
+
+
+def monthly_trend_lines(frames, store=None, plans=None):
+    if not frames:
+        return ["Місячний тренд: немає даних."]
+    latest = max(frames)
+    day = datetime.strptime(latest, "%Y-%m-%d").date()
+    frame = frames[latest]
+    if store:
+        frame = frame[frame.store == store]
+    lines = ["", f"📈 Місячний тренд на {day:%d.%m.%Y} — {store or 'РЕГІОН'}",
+             f"Місяць {day:%m.%Y}; минуло {day.day} із {calendar.monthrange(day.year, day.month)[1]} днів."]
+    if frame.empty:
+        return lines + ["Магазин відсутній у звіті за останню відому дату."]
+    if plans is None:
+        plans = load_monthly_plans(latest[:7])
+    for metric, label in (("sales", "Оборот"), ("accessories", "Аксесуари"), ("services", "Послуги")):
+        actuals = frame["cumulative_" + metric]
+        if actuals.isna().any():
+            lines.append(f"⚪ {label}: неповні дані факту.")
+            continue
+        actual = actuals.sum()
+        targets, missing = [], []
+        for _, row in frame.iterrows():
+            value = plans.loc[row.store, metric] if row.store in plans.index else None
+            # Preserve the existing turnover plan when the new tab has no override.
+            if (value is None or pd.isna(value)) and metric == "sales":
+                value = row.get("plan")
+            if value is None or pd.isna(value):
+                missing.append(row.store)
+            else:
+                targets.append(float(value))
+        if missing:
+            lines.append(f"⚪ {label}: факт {fmt(actual)}; немає плану для: " + ", ".join(missing))
+            continue
+        target = sum(targets)
+        if target <= 0:
+            lines.append(f"⚪ {label}: факт {fmt(actual)}; план {fmt(target)} — тренд не визначається.")
+            continue
+        forecast = actual / day.day * calendar.monthrange(day.year, day.month)[1]
+        trend = forecast / target * 100
+        icon = "🟢" if trend >= 100 else "🔴"
+        lines.append(f"{icon} {label}: факт {fmt(actual)} / план {fmt(target)}; виконання {actual/target*100:.2f}%; тренд {trend:.2f}% (прогноз {fmt(forecast)}).")
+    return lines
+
+
+
 def comparison_line(label, old, new, money=False):
     if old is None or new is None or pd.isna(old) or pd.isna(new):
         return f"⚪ {label}: немає бази для порівняння"
@@ -721,6 +829,7 @@ def daily_week(frames, end, store=None):
     oldq, newq = quality_summary(previous), quality_summary(current)
     for label in oldq:
         lines.append(comparison_line(label, oldq[label], newq[label]))
+    lines.extend(monthly_trend_lines(frames, store))
     for name in sorted(set(current.store)):
         before, after = previous[previous.store == name], current[current.store == name]
         if before.empty:
@@ -932,15 +1041,24 @@ def sync_google_sheets():
     credentials = Credentials.from_service_account_info(json.loads(config), scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
     with AuthorizedSession(credentials) as session:
         calendars = []
+        plan_title = None
         for sheet_id in (SALES_SHEET_ID, QUALITY_SHEET_ID):
             response = session.get(f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}",
                                    params={"fields": "sheets.properties.title"}, timeout=45)
             response.raise_for_status()
-            calendars.append(sheet_dates(response.json()))
+            metadata = response.json()
+            calendars.append(sheet_dates(metadata))
+            if sheet_id == SALES_SHEET_ID:
+                plan_titles = [item["properties"]["title"] for item in metadata.get("sheets", [])
+                               if item["properties"]["title"].strip().lower() == "плани"]
+                if len(plan_titles) > 1:
+                    raise ValueError("Залиш одну вкладку Плани в таблиці Продажі.")
+                plan_title = plan_titles[0] if plan_titles else None
         sales_dates, quality_dates = calendars
         common = sorted(set(sales_dates) & set(quality_dates))
         if not common:
             raise ValueError("Немає спільних дат. Назви вкладки в обох таблицях однаково, наприклад 01.11.2026.")
+        plans = parse_monthly_plans(google_table(session, SALES_SHEET_ID, plan_title)) if plan_title else []
         prepared = []
         for day in common:
             sales = google_table(session, SALES_SHEET_ID, sales_dates[day])
@@ -959,11 +1077,15 @@ def sync_google_sheets():
     conn = daily_db()
     try:
         with conn:
+            monthly_plans_db(conn)
             conn.executemany("INSERT OR REPLACE INTO daily_reports VALUES (?, ?)", prepared)
+            conn.execute("DELETE FROM monthly_plans")
+            conn.executemany("INSERT INTO monthly_plans VALUES (?, ?, ?, ?, ?)", plans)
     finally:
         conn.close()
     unpaired = sorted(set(sales_dates) ^ set(quality_dates))
     result = f"Оновлено {len(prepared)} дат. Остання дата — {common[-1]}. Перегляд — /day або /report."
+    result += f"\nПлани: завантажено {len(plans)} рядків." if plan_title else "\nВкладки Плани немає. Додай її в таблиці Продажі для трендів аксесуарів і послуг."
     if unpaired:
         result += "\nПропущені дати без пари вкладок: " + ", ".join(unpaired)
     return result
