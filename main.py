@@ -2266,9 +2266,29 @@ async def digest_loop(app):
         except Exception:
             log.exception("Scheduled group digest failed; will not send incomplete report")
 
+async def automatic_startup_test(app):
+    """One-off delayed send to verify the Railway scheduler without Telegram commands."""
+    if os.getenv("AUTO_TEST_ON_START", "").strip() != "1":
+        return
+    if not GROUP_CHAT_ID:
+        log.error("AUTO_TEST_ON_START enabled, but REPORT_GROUP_CHAT_ID is missing")
+        return
+    log.info("AUTO_TEST_ON_START enabled: scheduled a one-off report in 300 seconds")
+    await asyncio.sleep(300)
+    try:
+        day = datetime.now(REPORT_TZ).date() - timedelta(days=1)
+        await asyncio.to_thread(sync_google_sheets)
+        await asyncio.to_thread(sync_focus_google)
+        await send_digest(app.bot, GROUP_CHAT_ID, day, force=True)
+        log.info("AUTO TEST SUCCESS: photo sent to group %s for %s", GROUP_CHAT_ID, day)
+    except Exception:
+        log.exception("AUTO TEST FAILED: report not sent")
+
 async def setup_group_schedule(app):
     await setup_commands(app)
     app.create_task(digest_loop(app), name="group-digest-12-kyiv")
+    if os.getenv("AUTO_TEST_ON_START", "").strip() == "1":
+        app.create_task(automatic_startup_test(app), name="automatic-startup-test-5min")
     app.create_task(extra_digest_loop(app,"week"), name="weekly-digest-kyiv")
     app.create_task(extra_digest_loop(app,"month"), name="monthly-trend-kyiv")
 
