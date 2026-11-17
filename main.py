@@ -8,7 +8,8 @@ import re
 import io
 import sqlite3
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import pandas as pd
@@ -1636,6 +1637,8 @@ async def sync_cmd(update, context):
 async def setup_commands(app):
     await app.bot.set_my_commands([
         BotCommand("focus", "🎯 Фокуси + категорії"),
+        BotCommand("group_test", "Тест відправки у групу"),
+        BotCommand("group_here", "Дізнатись ID групи"),
         BotCommand("sync", "Оновити дані з Google Таблиць"),
         BotCommand("day", "Обрати дату та магазин або регіон"),
         BotCommand("weeks", "Тиждень за номером без порівняння"),
@@ -1733,18 +1736,166 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Скасовано.")
     return ConversationHandler.END
 
+
+# Automated Telegram group digest (Kyiv time).
+REPORT_TZ = ZoneInfo("Europe/Kyiv")
+GROUP_CHAT_ID = os.getenv("REPORT_GROUP_CHAT_ID", "").strip()
+
+def group_report_text(day):
+    key = day.isoformat()
+    frames = daily_frames()
+    if key not in frames:
+        raise ValueError(f"Немає продажів за {day:%d.%m.%Y}.")
+    frame = frames[key]
+    if frame.empty or frame[["sales", "direct", "pickup", "accessories", "services"]].isna().any().any():
+        raise ValueError("Немає повних денних продажів (перевір також попередній день).")
+    plans = load_monthly_plans(day.strftime("%Y-%m"))
+    days = calendar.monthrange(day.year, day.month)[1]
+    metrics = (("sales", "Оборот"), ("accessories", "Аксесуари"), ("services", "Послуги"))
+    lines = [f"📊 МОЙО — РЕГІОН | {day:%d.%m.%Y}", "ВИТОРГ ЗА ВЧОРА"]
+    for metric, label in (("sales", "Оборот"), ("direct", "Прямі"), ("pickup", "Пікап"),
+                          ("accessories", "Аксесуари"), ("services", "Послуги")):
+        lines.append(f"• {label}: {fmt(frame[metric].sum())}")
+    lines.extend(["", "📈 ВИКОНАННЯ ДЕННОГО ПЛАНУ — РЕГІОН"])
+    for metric, label in metrics:
+        missing = [store for store in frame.store if store not in plans.index or
+                   pd.isna(plans.loc[store, metric])]
+        if missing:
+            lines.append(f"⚪ {label}: немає плану ({', '.join(missing)})")
+            continue
+        target = sum(float(plans.loc[store, metric]) for store in frame.store) / days
+        if target <= 0:
+            lines.append(f"⚪ {label}: немає додатного плану")
+        else:
+            value = frame[metric].sum() / target * 100
+            icon = "🟢" if value >= 100 else "🟡" if value >= 90 else "🔴"
+            lines.append(f"{icon} {label}: {value:.2f}%")
+    lines.extend(["", "🏬 МАГАЗИНИ — ВИКОНАННЯ ПЛАНУ", "Оборот | Акс. | Послуги"])
+    ranking = []
+    for _, row in frame.iterrows():
+        result = []
+        for metric, _ in metrics:
+            if row.store not in plans.index or pd.isna(plans.loc[row.store, metric]):
+                result.append("⚪ н/д")
+                continue
+            target = float(plans.loc[row.store, metric]) / days
+            if target <= 0:
+                result.append("⚪ н/д")
+                continue
+            value = float(row[metric]) / target * 100
+            icon = "🟢" if value >= 100 else "🟡" if value >= 90 else "🔴"
+            result.append(f"{icon} {value:.1f}%")
+        ranking.append((float(row.sales) / (float(plans.loc[row.store, "sales"]) / days)
+                        if row.store in plans.index and pd.notna(plans.loc[row.store, "sales"])
+                        and float(plans.loc[row.store, "sales"]) > 0 else -1,
+                        row.store, result))
+    for _, store, result in sorted(ranking, key=lambda item: item[0], reverse=True):
+        lines.append(f"• {store}: {' | '.join(result)}")
+    data = focus_data()
+    if not data or not any(d == key for _, d in data):
+        raise ValueError(f"Немає фокусів за {day:%d.%m.%Y}.")
+    lines.extend(["", focus_date_report(data, day)])
+    return "\n".join(lines)
+
+def digest_db():
+    conn = db()
+    conn.execute("CREATE TABLE IF NOT EXISTS group_digest_sent (report_date TEXT PRIMARY KEY, chat_id TEXT NOT NULL)")
+    return conn
+
+async def send_digest(bot, chat_id, day, force=False):
+    conn = digest_db()
+    try:
+        already = conn.execute("SELECT chat_id FROM group_digest_sent WHERE report_date = ?", (day.isoformat(),)).fetchone()
+    finally:
+        conn.close()
+    if already and not force:
+        return False
+    report = group_report_text(day)
+    # Split before HTML escaping, preserving Telegram's 4096-character limit.
+    lines, chunk = report.splitlines(), ""
+    chunks = []
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 2800 and chunk:
+            chunks.append(chunk)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk:
+        chunks.append(chunk)
+    for part in chunks:
+        await bot.send_message(chat_id=int(chat_id), text=bold_report_percentages(part), parse_mode="HTML")
+    conn = digest_db()
+    try:
+        with conn:
+            conn.execute("INSERT OR REPLACE INTO group_digest_sent VALUES (?, ?)", (day.isoformat(), str(chat_id)))
+    finally:
+        conn.close()
+    return True
+
+async def group_here(update, context):
+    if not is_owner(update):
+        return
+    if update.effective_chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Додай бота до групи та виконай /group_here там.")
+        return
+    await update.message.reply_text(
+        f"ID цієї групи: {update.effective_chat.id}\n"
+        "Додай у Railway змінну REPORT_GROUP_CHAT_ID з цим значенням. "
+        "Після перезапуску бот відправлятиме звіт щодня о 12:00 за Києвом."
+    )
+
+async def group_test(update, context):
+    if not is_owner(update):
+        return
+    chat_id = GROUP_CHAT_ID or (str(update.effective_chat.id)
+              if update.effective_chat.type in ("group", "supergroup") else "")
+    if not chat_id:
+        await update.message.reply_text("Спочатку додай REPORT_GROUP_CHAT_ID у Railway або виконай /group_test у групі.")
+        return
+    day = datetime.now(REPORT_TZ).date() - timedelta(days=1)
+    try:
+        await send_digest(context.bot, chat_id, day, force=True)
+        await update.message.reply_text(f"Тестовий звіт за {day:%d.%m.%Y} надіслано.")
+    except Exception as exc:
+        log.exception("Test group digest failed")
+        await update.message.reply_text(f"Тест не надіслано: {exc}")
+
+async def digest_loop(app):
+    while True:
+        now = datetime.now(REPORT_TZ)
+        target = datetime.combine(now.date(), dt_time(12, 0), REPORT_TZ)
+        if now >= target:
+            target += timedelta(days=1)
+        await asyncio.sleep(max(1, (target - now).total_seconds()))
+        if not GROUP_CHAT_ID:
+            continue
+        day = datetime.now(REPORT_TZ).date() - timedelta(days=1)
+        try:
+            # Refresh both sources before sending, avoid stale data.
+            await asyncio.to_thread(sync_google_sheets)
+            await asyncio.to_thread(sync_focus_google)
+            await send_digest(app.bot, GROUP_CHAT_ID, day)
+        except Exception:
+            log.exception("Scheduled group digest failed; will not send incomplete report")
+
+async def setup_group_schedule(app):
+    await setup_commands(app)
+    app.create_task(digest_loop(app), name="group-digest-12-kyiv")
+
+
 def main():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN environment variable is missing")
     if not OWNER_ID:
         raise RuntimeError("OWNER_ID environment variable is missing")
-    app = Application.builder().token(TOKEN).post_init(setup_commands).build()
+    app = Application.builder().token(TOKEN).post_init(setup_group_schedule).build()
     conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Document.ALL, handle_document)],
         states={DATE_WAIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, date_received)]},
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
     )
+    app.add_handler(CommandHandler("group_here", group_here))
+    app.add_handler(CommandHandler("group_test", group_test))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("status", status))
