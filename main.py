@@ -1984,6 +1984,208 @@ def digest_dashboard(day):
     buf.seek(0); buf.name='moyo_digest.png'
     return buf
 
+
+# Additional visual reports: completed week and current-month store trends.
+def performance_dashboard(mode, reference_day):
+    from PIL import Image, ImageDraw, ImageFont
+    import matplotlib
+    frames = daily_frames()
+    metrics = [('sales', 'Оборот'), ('accessories', 'Аксесуари'), ('services', 'Послуги')]
+    if mode == 'week':
+        end = reference_day
+        start = end - timedelta(days=6)
+        dates = [(start + timedelta(days=i)).isoformat() for i in range(7)]
+        missing = [x for x in dates if x not in frames]
+        if missing:
+            raise ValueError('Немає повних даних за тиждень: ' + ', '.join(missing))
+        daily = [frames[x] for x in dates]
+        stores = sorted(set().union(*(set(f.store) for f in daily)))
+        records = []
+        for store in stores:
+            rows = [f[f.store == store] for f in daily]
+            if any(len(r) != 1 for r in rows):
+                raise ValueError(f'Неповний тиждень для {store}')
+            actual = {m: sum(float(r.iloc[0][m]) for r in rows) for m, _ in metrics}
+            goals = {}
+            for m, _ in metrics:
+                goal = 0.0
+                for day_key in dates:
+                    d = datetime.strptime(day_key, '%Y-%m-%d').date()
+                    plans = load_monthly_plans(d.strftime('%Y-%m'))
+                    if store not in plans.index or m not in plans.columns or pd.isna(plans.loc[store,m]):
+                        goal = None
+                        break
+                    goal += float(plans.loc[store,m]) / calendar.monthrange(d.year,d.month)[1]
+                goals[m] = goal
+            records.append((store, actual, goals))
+        title = 'ПІДСУМКИ ТИЖНЯ'
+        period = f'{start:%d.%m.%Y} — {end:%d.%m.%Y}'
+        descriptor = 'Виконання плану за 7 днів'
+    else:
+        month = reference_day.strftime('%Y-%m')
+        keys = sorted(k for k in frames if k.startswith(month) and k <= reference_day.isoformat())
+        if not keys:
+            raise ValueError('Немає даних за поточний місяць')
+        latest = datetime.strptime(keys[-1], '%Y-%m-%d').date()
+        source = frames[keys[-1]]
+        plans = load_monthly_plans(month)
+        records = []
+        for _, r in source.iterrows():
+            store = str(r.store)
+            actual = {m: float(r['cumulative_'+m]) for m,_ in metrics}
+            goals = {m: float(plans.loc[store,m]) if store in plans.index and m in plans.columns and pd.notna(plans.loc[store,m]) else None for m,_ in metrics}
+            records.append((store,actual,goals))
+        title = 'МІСЯЧНИЙ ТРЕНД ПО МАГАЗИНАХ'
+        period = f'01.{latest:%m.%Y} — {latest:%d.%m.%Y}'
+        descriptor = f'Прогноз виконання на кінець місяця · {latest.day} днів факту'
+    def percent(actual, goal):
+        if goal is None or goal <= 0 or not math.isfinite(actual):
+            return None
+        if mode == 'month':
+            actual = actual / latest.day * calendar.monthrange(latest.year,latest.month)[1]
+        return actual / goal * 100
+    ranking = [(store, [percent(actual[m],goals[m]) for m,_ in metrics], actual, goals)
+               for store,actual,goals in records]
+    ranking.sort(key=lambda x: x[1][0] if x[1][0] is not None else -1,reverse=True)
+    totals = []
+    for m,label in metrics:
+        valid = all(a[m] is not None and g[m] is not None and math.isfinite(a[m]) for _,a,g in records)
+        total_actual = sum(a[m] for _,a,g in records) if valid else None
+        total_goal = sum(g[m] for _,a,g in records) if valid else None
+        totals.append((label,percent(total_actual,total_goal) if valid else None,total_actual))
+    W=1100
+    H=445+len(ranking)*52+250
+    im=Image.new('RGB',(W,H),'#eaf2fb')
+    d=ImageDraw.Draw(im)
+    font_dir=Path(matplotlib.get_data_path())/'fonts'/'ttf'
+    def font(sz,bold=False):
+        return ImageFont.truetype(str(font_dir/('DejaVuSans-Bold.ttf' if bold else 'DejaVuSans.ttf')),sz)
+    def text(x,y,value,sz=19,color='#193451',bold=False):
+        d.text((x,y),str(value),font=font(sz,bold),fill=color)
+    def rect(x0,y0,x1,y1,color,r=12):
+        d.rounded_rectangle((x0,y0,x1,y1),radius=r,fill=color)
+    def pct(v):
+        return 'н/д' if v is None else f'{v:.1f}%'
+    def color(v):
+        return '#7b8fa6' if v is None else '#17a85b' if v>=100 else '#f0b52e' if v>=90 else '#e44f59'
+    def bar(x,y,w,v):
+        rect(x,y,x+w,y+13,'#e1eaf2',6)
+        if v is not None and v>0:
+            rect(x,y,x+max(4,int(w*min(v,100)/100)),y+13,color(v),6)
+    aliases={'Київ-Олімпійський':'Олімпійський','Київ-Аркадія':'Аркадія','Київ-Нью Вей':'Нью Вей','Київ-Хрещатик 21':'Хрещатик 21','Київ-Аладдін':'Аладін','Київ-Комод':'Комод','Буча-Рітейл Парк':'Буча','Київ-Квадрат':'Квадрат','Київ-Материк':'Материк','Київ-Ретровіль':'Ретровіль','Київ-Дрімтаун_new':'Дрім Таун','Київ-Лавіна Молл':'Лавіна','Київ-Республіка Парк':'Республіка Парк','Київ-Блокбастер':'Блокбастер'}
+    rect(15,15,W-15,92,'#12375c',16)
+    text(35,32,'MOYO | '+title,27,'white',True)
+    rect(15,107,W-15,290,'white')
+    text(35,122,period,24,bold=True)
+    text(35,157,descriptor,17,'#60758b')
+    for i,(label,value,actual) in enumerate(totals):
+        x=35+i*350
+        text(x,202,label,21,bold=True)
+        text(x+145,202,pct(value),25,color(value),True)
+        bar(x,252,300,value)
+    table_top=308
+    table_end=table_top+102+len(ranking)*52
+    rect(15,table_top,W-15,table_end,'white')
+    text(35,table_top+12,'МАГАЗИНИ — '+('ВИКОНАННЯ ТИЖНЯ' if mode=='week' else 'ПРОГНОЗ ВИКОНАННЯ МІСЯЦЯ'),22,bold=True)
+    rect(32,table_top+48,W-32,table_top+86,'#23466f',6)
+    for x,label in [(45,'Магазин'),(395,'Оборот'),(630,'Аксесуари'),(865,'Послуги')]:
+        text(x,table_top+54,label,18,'white',True)
+    for i,(store,vals,_,_) in enumerate(ranking):
+        y=table_top+92+i*52
+        if i%2==0: rect(33,y,W-33,y+45,'#eff4fa',5)
+        text(45,y+10,aliases.get(store,store.removeprefix('Київ-'))[:22],18,bold=True)
+        for x,v in zip((395,630,865),vals):
+            text(x,y+10,pct(v),18,color(v),True)
+            bar(x+110,y+18,92,v)
+    bottom=table_end+18
+    rect(15,bottom,W-15,bottom+207,'white')
+    text(35,bottom+12,'ТОП / АНТИТОП — ЗА ОБОРОТОМ',24,bold=True)
+    valid=[r for r in ranking if r[1][0] is not None]
+    for x,items,label,c in [(40,valid[:3],'ТОП-3','#168d51'),(565,list(reversed(valid[-3:])),'АНТИТОП-3','#c9404b')]:
+        text(x,bottom+54,label,21,c,True)
+        for i,(store,vals,_,_) in enumerate(items):
+            y=bottom+88+i*34
+            text(x,y,f'{i+1}. {aliases.get(store,store.removeprefix("Київ-"))[:20]}',17,bold=True)
+            text(x+365,y,pct(vals[0]),18,c,True)
+    buf=io.BytesIO()
+    im.crop((0,0,W,bottom+224)).save(buf,format='PNG',optimize=True)
+    buf.seek(0)
+    buf.name=f'moyo_{mode}.png'
+    return buf
+
+def extra_digest_db():
+    conn=db()
+    conn.execute('CREATE TABLE IF NOT EXISTS extra_digest_sent (kind TEXT, period TEXT, chat_id TEXT, PRIMARY KEY(kind,period,chat_id))')
+    return conn
+
+async def send_extra_digest(bot,chat_id,kind,day,force=False):
+    period=(day-timedelta(days=6)).isoformat() if kind=='week' else day.isoformat()
+    conn=extra_digest_db()
+    try:
+        sent=conn.execute('SELECT 1 FROM extra_digest_sent WHERE kind=? AND period=? AND chat_id=?',(kind,period,str(chat_id))).fetchone()
+    finally:
+        conn.close()
+    if sent and not force:
+        return False
+    picture=await asyncio.to_thread(performance_dashboard,kind,day)
+    caption=('📊 МОЙО — тижневий звіт' if kind=='week' else '📈 МОЙО — місячний тренд по магазинах')
+    await bot.send_photo(chat_id=int(chat_id),photo=picture,caption=caption)
+    conn=extra_digest_db()
+    try:
+        with conn:
+            conn.execute('INSERT OR REPLACE INTO extra_digest_sent VALUES (?,?,?)',(kind,period,str(chat_id)))
+    finally:
+        conn.close()
+    return True
+
+async def group_week_test(update,context):
+    if not is_owner(update): return
+    chat_id=GROUP_CHAT_ID or str(update.effective_chat.id)
+    today=datetime.now(REPORT_TZ).date()
+    last_sunday=today-timedelta(days=today.weekday()+1)
+    try:
+        await asyncio.to_thread(sync_google_sheets)
+        await send_extra_digest(context.bot,chat_id,'week',last_sunday,True)
+        await update.message.reply_text('Тижневий тест надіслано.')
+    except Exception as exc:
+        log.exception('Weekly report test failed')
+        await update.message.reply_text(f'Тижневий тест: {exc}')
+
+async def group_month_test(update,context):
+    if not is_owner(update): return
+    chat_id=GROUP_CHAT_ID or str(update.effective_chat.id)
+    today=datetime.now(REPORT_TZ).date()
+    try:
+        await asyncio.to_thread(sync_google_sheets)
+        await send_extra_digest(context.bot,chat_id,'month',today-timedelta(days=1),True)
+        await update.message.reply_text('Тест місячного тренду надіслано.')
+    except Exception as exc:
+        log.exception('Monthly trend test failed')
+        await update.message.reply_text(f'Тест місячного тренду: {exc}')
+
+async def extra_digest_loop(app,kind):
+    # Week: Monday 12:10 for completed Mon-Sun; month: daily 12:15 for latest data.
+    hour,minute=12,(10 if kind=='week' else 15)
+    while True:
+        now=datetime.now(REPORT_TZ)
+        target=datetime.combine(now.date(),dt_time(hour,minute),REPORT_TZ)
+        if kind=='week':
+            target+=timedelta(days=(7-now.weekday())%7)
+        if now>=target:
+            target+=timedelta(days=7 if kind=='week' else 1)
+        await asyncio.sleep(max(1,(target-now).total_seconds()))
+        if not GROUP_CHAT_ID: continue
+        today=datetime.now(REPORT_TZ).date()
+        day=today-timedelta(days=1)
+        if kind=='week':
+            day=today-timedelta(days=today.weekday()+1)
+        try:
+            await asyncio.to_thread(sync_google_sheets)
+            await send_extra_digest(app.bot,GROUP_CHAT_ID,kind,day)
+        except Exception:
+            log.exception('Scheduled %s report failed',kind)
+
+
 def digest_db():
     conn = db()
     conn.execute("CREATE TABLE IF NOT EXISTS group_digest_sent (report_date TEXT PRIMARY KEY, chat_id TEXT NOT NULL)")
@@ -2067,6 +2269,8 @@ async def digest_loop(app):
 async def setup_group_schedule(app):
     await setup_commands(app)
     app.create_task(digest_loop(app), name="group-digest-12-kyiv")
+    app.create_task(extra_digest_loop(app,"week"), name="weekly-digest-kyiv")
+    app.create_task(extra_digest_loop(app,"month"), name="monthly-trend-kyiv")
 
 
 def main():
@@ -2083,6 +2287,8 @@ def main():
     )
     app.add_handler(CommandHandler("group_here", group_here))
     app.add_handler(CommandHandler("group_test", group_test))
+    app.add_handler(CommandHandler("group_week_test", group_week_test))
+    app.add_handler(CommandHandler("group_month_test", group_month_test))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("status", status))
