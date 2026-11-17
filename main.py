@@ -998,6 +998,7 @@ async def day_selected(update, context):
 
 SALES_SHEET_ID = "1JmXrIBABlzrUFG5IsOgjTD_rG7zbAzvdLBnB4FDlqnE"
 QUALITY_SHEET_ID = "18snM8aRqhGmnws4Fx7UbyXzAKexpVzl5p60nEAKJaNQ"
+PLANS_SHEET_ID = "1vPS13rER8_vzJxKkoKaDHcrWTcxjntQXJFEgLBu8w50"
 
 
 def sheet_dates(metadata):
@@ -1032,33 +1033,56 @@ def google_table(session, sheet_id, title):
     raise ValueError(f"У вкладці {title} не знайдено заголовок Склад.")
 
 
+def fetch_monthly_plans(session):
+    response = session.get(f"https://sheets.googleapis.com/v4/spreadsheets/{PLANS_SHEET_ID}",
+                           params={"fields": "sheets.properties.title"}, timeout=45)
+    response.raise_for_status()
+    months = {}
+    for sheet in response.json().get("sheets", []):
+        title = sheet["properties"]["title"]
+        if not re.fullmatch(r"\d{2}\.\d{4}", title.strip()):
+            continue
+        try:
+            month = datetime.strptime(title.strip(), "%m.%Y").strftime("%m.%Y")
+        except ValueError:
+            raise ValueError(f"Таблиця планів: некоректний місяць у назві вкладки {title}.")
+        if month in months:
+            raise ValueError(f"Таблиця планів: дві вкладки за {month}. Залиш одну.")
+        months[month] = title
+    if not months:
+        raise ValueError("Таблиця планів: назви вкладки місяцями у форматі ММ.РРРР, наприклад 11.2026.")
+    records = []
+    for month, title in months.items():
+        try:
+            frame = google_table(session, PLANS_SHEET_ID, title)
+            frame = frame.loc[~frame.apply(lambda row: all(pd.isna(v) or str(v).strip() == "" for v in row), axis=1)].copy()
+            frame["Місяць"] = month
+            records.extend(parse_monthly_plans(frame))
+        except ValueError as exc:
+            raise ValueError(f"Плани за {month}: {exc}") from exc
+    return records
+
+
 def sync_google_sheets():
     from google.oauth2.service_account import Credentials
     from google.auth.transport.requests import AuthorizedSession
     config = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not config:
-        raise ValueError("Додай GOOGLE_SERVICE_ACCOUNT_JSON у змінні Railway та надай службовому акаунту доступ до обох таблиць.")
+        raise ValueError("Додай GOOGLE_SERVICE_ACCOUNT_JSON у змінні Railway та надай службовому акаунту доступ до всіх трьох таблиць.")
     credentials = Credentials.from_service_account_info(json.loads(config), scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
     with AuthorizedSession(credentials) as session:
         calendars = []
-        plan_title = None
         for sheet_id in (SALES_SHEET_ID, QUALITY_SHEET_ID):
             response = session.get(f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}",
                                    params={"fields": "sheets.properties.title"}, timeout=45)
             response.raise_for_status()
             metadata = response.json()
             calendars.append(sheet_dates(metadata))
-            if sheet_id == SALES_SHEET_ID:
-                plan_titles = [item["properties"]["title"] for item in metadata.get("sheets", [])
-                               if item["properties"]["title"].strip().lower() == "плани"]
-                if len(plan_titles) > 1:
-                    raise ValueError("Залиш одну вкладку Плани в таблиці Продажі.")
-                plan_title = plan_titles[0] if plan_titles else None
         sales_dates, quality_dates = calendars
         common = sorted(set(sales_dates) & set(quality_dates))
         if not common:
             raise ValueError("Немає спільних дат. Назви вкладки в обох таблицях однаково, наприклад 01.11.2026.")
-        plans = parse_monthly_plans(google_table(session, SALES_SHEET_ID, plan_title)) if plan_title else []
+        plans = fetch_monthly_plans(session)
         prepared = []
         for day in common:
             sales = google_table(session, SALES_SHEET_ID, sales_dates[day])
@@ -1085,7 +1109,7 @@ def sync_google_sheets():
         conn.close()
     unpaired = sorted(set(sales_dates) ^ set(quality_dates))
     result = f"Оновлено {len(prepared)} дат. Остання дата — {common[-1]}. Перегляд — /day або /report."
-    result += f"\nПлани: завантажено {len(plans)} рядків." if plan_title else "\nВкладки Плани немає. Додай її в таблиці Продажі для трендів аксесуарів і послуг."
+    result += f"\nПлани: завантажено {len(plans)} рядків із окремої таблиці."
     if unpaired:
         result += "\nПропущені дати без пари вкладок: " + ", ".join(unpaired)
     return result
@@ -1107,7 +1131,7 @@ async def sync_cmd(update, context):
         result = str(exc)
     except Exception as exc:
         log.error("Google Sheets sync failed: %s", type(exc).__name__)
-        result = "Оновлення не вдалося. Перевір доступ службового акаунта до обох таблиць, увімкнення Google Sheets API та з’єднання. Спробуй /sync знову."
+        result = "Оновлення не вдалося. Перевір доступ службового акаунта до всіх трьох таблиць, увімкнення Google Sheets API та з’єднання. Спробуй /sync знову."
     finally:
         context.bot_data["sync_running"] = False
     for offset in range(0, len(result), 3500):
