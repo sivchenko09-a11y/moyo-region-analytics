@@ -1,4 +1,5 @@
 import os
+import calendar
 import re
 import io
 import sqlite3
@@ -7,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ConversationHandler,
     ContextTypes, filters
@@ -178,13 +179,18 @@ def make_report(report_date, current, previous, previous_date):
     ]
     for m in metrics:
         lines.append(f"• {labels[m]}: {fmt(changes[m])}")
-    lines += ["", "НАКОПИЧУВАЛЬНО З 01.11"]
+    report_day = datetime.strptime(report_date, "%Y-%m-%d")
+    days_in_month = calendar.monthrange(report_day.year, report_day.month)[1]
+    lines += ["", f"НАКОПИЧУВАЛЬНО З 01.{report_day.month:02d}"]
     for m in metrics:
         lines.append(f"• {labels[m]}: {fmt(totals[m])}")
     if plan:
         lines += [
             f"• План місяця: {fmt(plan)}",
-            f"• Виконання плану: {pct(totals['sales'], plan):.2f}%",
+            f"• Факт виконання плану: {pct(totals['sales'], plan):.2f}%",
+            f"• Тренд виконання: {pct(totals['sales'] / report_day.day * days_in_month, plan):.2f}%",
+            f"• Прогноз продажів за місяць: {fmt(totals['sales'] / report_day.day * days_in_month)}",
+            "Тренд за поточним середньоденним темпом, включно з датою звіту.",
         ]
 
     if prev is not None:
@@ -231,6 +237,48 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Останній збережений звіт: {row[0] or 'ще немає'}"
     )
+
+async def dates_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    conn = db()
+    try:
+        rows = conn.execute(
+            "SELECT report_date, COUNT(*) FROM snapshots GROUP BY report_date ORDER BY report_date DESC LIMIT 30"
+        ).fetchall()
+    finally:
+        conn.close()
+    lines = ["Останні збережені дати (до 30):"]
+    lines.extend(f"{date} — {count} магазинів" for date, count in rows)
+    await update.message.reply_text("\n".join(lines) if rows else "Звітів ще немає.")
+
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    conn = db()
+    try:
+        report_date = conn.execute("SELECT MAX(report_date) FROM snapshots").fetchone()[0]
+    finally:
+        conn.close()
+    if not report_date:
+        await update.message.reply_text("Спочатку надішли звіт.")
+        return
+    current = get_snapshot(report_date)
+    prev_date = previous_snapshot(report_date)
+    previous = get_snapshot(prev_date) if prev_date else None
+    report = make_report(report_date, current, previous, prev_date)
+    for offset in range(0, len(report), 4000):
+        await update.message.reply_text(report[offset:offset + 4000])
+
+async def setup_commands(app):
+    await app.bot.set_my_commands([
+        BotCommand("report", "Останній звіт і тренд регіону"),
+        BotCommand("dates", "Збережені дати та кількість магазинів"),
+        BotCommand("status", "Дата останнього звіту"),
+        BotCommand("cancel", "Скасувати введення дати"),
+        BotCommand("help", "Як завантажувати звіти"),
+        BotCommand("start", "Початок роботи"),
+    ])
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
@@ -307,7 +355,7 @@ def main():
         raise RuntimeError("BOT_TOKEN environment variable is missing")
     if not OWNER_ID:
         raise RuntimeError("OWNER_ID environment variable is missing")
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(setup_commands).build()
     conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Document.ALL, handle_document)],
         states={DATE_WAIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, date_received)]},
@@ -317,7 +365,10 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("report", report_cmd))
+    app.add_handler(CommandHandler("dates", dates_cmd))
     app.add_handler(conv)
+    app.add_handler(CommandHandler("cancel", cancel))
     app.run_polling()
 
 if __name__ == "__main__":
