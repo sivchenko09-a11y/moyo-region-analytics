@@ -226,7 +226,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Надішли файл XLSX, XLS або CSV з накопичувальними даними з 01 числа. "
         "У підписі вкажи дату зрізу, наприклад: 16.11.2026.\n"
         "Команда /status покаже останню збережену дату.\n"
-        "/focus — фокуси й категорії: дата (MoM/YoY), тиждень та поточний місяць MTD.\n"
+        "/focus — фокуси й категорії: дата (місяць до місяця / Рік до Року), тиждень та Поточний місяць.\n"
         "/weeks — обрати тиждень за номером без порівняння.\n"
         "/week — порівняти календарні тижні."
     )
@@ -1370,16 +1370,26 @@ def focus_comparison_date(day, year, month):
     return day.replace(year=year, month=month)
 
 
-def focus_date_report(data, day):
+def focus_categories(selected=None):
+    """Return one selected focus or all directions, preserving sheet order."""
+    values = list(FOCUS_CONFIG.values())
+    if selected is None:
+        return values
+    if not 0 <= selected < len(values):
+        raise ValueError("Невідомий напрямок фокусів.")
+    return [values[selected]]
+
+
+def focus_date_report(data, day, selected=None):
     previous_month = day.replace(day=1) - timedelta(days=1)
     lines = [f"🎯 Фокуси + категорії — РЕГІОН, {day:%d.%m.%Y}",
              "ЗА ОБРАНУ ДАТУ — порівняння аналогічних календарних дат."]
-    for category, unit, _ in FOCUS_CONFIG.values():
+    for category, unit, _ in focus_categories(selected):
         daily = data.get((category, day.isoformat()))
         current = daily[1] if daily is not None else None
         lines.extend(["", category, f"Факт {day:%d.%m.%Y}: {focus_value(current, unit)}"])
-        for label, year, month in (("MoM", previous_month.year, previous_month.month),
-                                   ("YoY", day.year - 1, day.month)):
+        for label, year, month in (("місяць до місяця", previous_month.year, previous_month.month),
+                                   ("Рік до Року", day.year - 1, day.month)):
             comparison = focus_comparison_date(day, year, month)
             if comparison is None:
                 lines.append(f"{label}: аналогічної календарної дати немає")
@@ -1390,17 +1400,17 @@ def focus_date_report(data, day):
     return "\n".join(lines)
 
 
-def focus_mtd_report(data, day):
+def focus_mtd_report(data, day, selected=None):
     """Month-to-date through the latest known date, compared over equal day counts."""
     previous_month = day.replace(day=1) - timedelta(days=1)
-    lines = ["🎯 Фокуси + категорії — РЕГІОН · MTD",
+    lines = ["🎯 Фокуси + категорії — РЕГІОН · Поточний місяць",
              f"Поточний період: {day.replace(day=1):%d.%m.%Y}–{day:%d.%m.%Y}",
              "Порівняння накопичувальних показників за однакові календарні дні."]
-    for category, unit, _ in FOCUS_CONFIG.values():
+    for category, unit, _ in focus_categories(selected):
         current = focus_total(data, category, day.replace(day=1), day)
-        lines.extend(["", category, f"Факт MTD: {focus_value(current, unit)}"])
-        for label, year, month in (("MoM", previous_month.year, previous_month.month),
-                                   ("YoY", day.year - 1, day.month)):
+        lines.extend(["", category, f"Факт за поточний місяць: {focus_value(current, unit)}"])
+        for label, year, month in (("місяць до місяця", previous_month.year, previous_month.month),
+                                   ("Рік до Року", day.year - 1, day.month)):
             if day.day > calendar.monthrange(year, month)[1]:
                 lines.append(f"{label}: немає рівного календарного періоду в {month:02d}.{year}")
                 continue
@@ -1410,7 +1420,7 @@ def focus_mtd_report(data, day):
     return "\n".join(lines)
 
 
-def focus_week_report(data, monday):
+def focus_week_report(data, monday, selected=None):
     latest = datetime.strptime(max(day for _, day in data), "%Y-%m-%d").date()
     end = min(monday+timedelta(days=6), latest)
     if end < monday:
@@ -1420,7 +1430,7 @@ def focus_week_report(data, monday):
              f"Порівняння: {previous_start:%d.%m.%Y}–{previous_end:%d.%m.%Y} → {monday:%d.%m.%Y}–{end:%d.%m.%Y}"]
     if (end-monday).days < 6:
         lines.append("Неповний тиждень: порівнюються однакові дні тижня.")
-    for category, unit, _ in FOCUS_CONFIG.values():
+    for category, unit, _ in focus_categories(selected):
         old = focus_total(data, category, previous_start, previous_end)
         new = focus_total(data, category, monday, end)
         lines.extend(["", f"{category}: факт {focus_value(new,unit)}", focus_change(old,new,unit)])
@@ -1442,10 +1452,11 @@ async def focus_send(message, report):
 async def focus_cmd(update, context):
     if not is_owner(update):
         return
-    await update.message.reply_text("🎯 Фокуси + категорії — регіон\nОбери перегляд:", reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("📅 За датою · місяць і рік", callback_data="focus:dates:0")],
-        [InlineKeyboardButton("📊 Тиждень до тижня", callback_data="focus:weeks:0")],
-        [InlineKeyboardButton("📈 Поточний місяць · MTD", callback_data="focus:mtd:latest")]]))
+    buttons = [[InlineKeyboardButton("📋 Усі напрямки", callback_data="focus:menu:all")]]
+    for i, (category, _, _) in enumerate(FOCUS_CONFIG.values()):
+        buttons.append([InlineKeyboardButton(f"🎯 {category}", callback_data=f"focus:menu:{i}")])
+    await update.message.reply_text("🎯 Фокуси + категорії — регіон\nОбери напрямок:",
+                                    reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def focus_selected(update, context):
@@ -1454,15 +1465,37 @@ async def focus_selected(update, context):
         await query.answer("Доступ лише власнику.", show_alert=True)
         return
     await query.answer()
-    _, mode, value = query.data.split(":", 2)
+    parts = query.data.split(":")
+    mode = parts[1]
     data = focus_data()
     if not data:
         await query.message.reply_text("Спочатку онови фокуси через /sync.")
         return
     dates = sorted({day for _, day in data}, reverse=True)
+    if mode == "menu":
+        choice = parts[2]
+        selected = None if choice == "all" else int(choice)
+        name = "Усі напрямки" if selected is None else focus_categories(selected)[0][0]
+        await query.message.reply_text(f"🎯 {name}\nОбери період:", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📅 Конкретна дата · порівняння", callback_data=f"focus:dates:{choice}:0")],
+            [InlineKeyboardButton("📊 Тиждень до тижня", callback_data=f"focus:weeks:{choice}:0")],
+            [InlineKeyboardButton("📈 Поточний місяць", callback_data=f"focus:mtd:{choice}:latest")],
+            [InlineKeyboardButton("↩️ Інший напрямок", callback_data="focus:back:all")]]))
+        return
+    if mode == "back":
+        await focus_cmd(SimpleNamespace(message=query.message, effective_user=update.effective_user), context)
+        return
+    if len(parts) != 4:
+        await query.message.reply_text("Меню застаріло. Відкрий /focus знову.")
+        return
+    choice, value = parts[2], parts[3]
+    selected = None if choice == "all" else int(choice)
+    focus_categories(selected)
     if mode in ("dates", "weeks"):
         if mode == "weeks":
-            choices = sorted({(datetime.strptime(day, "%Y-%m-%d").date()-timedelta(days=datetime.strptime(day, "%Y-%m-%d").weekday())).isoformat() for day in dates}, reverse=True)
+            choices = sorted({(datetime.strptime(day, "%Y-%m-%d").date() -
+                              timedelta(days=datetime.strptime(day, "%Y-%m-%d").weekday())).isoformat()
+                              for day in dates}, reverse=True)
         else:
             choices = dates
         page = min(max(int(value), 0), (len(choices)-1)//15)
@@ -1471,24 +1504,29 @@ async def focus_selected(update, context):
             day = datetime.strptime(date, "%Y-%m-%d").date()
             label = week_title(day) if mode == "weeks" else f"{day:%d.%m.%Y}"
             action = "week" if mode == "weeks" else "date"
-            buttons.append([InlineKeyboardButton(label, callback_data=f"focus:{action}:{date}")])
+            buttons.append([InlineKeyboardButton(label, callback_data=f"focus:{action}:{choice}:{date}")])
         nav = []
         if page:
-            nav.append(InlineKeyboardButton("Новіші", callback_data=f"focus:{mode}:{page-1}"))
+            nav.append(InlineKeyboardButton("Новіші", callback_data=f"focus:{mode}:{choice}:{page-1}"))
         if (page+1)*15 < len(choices):
-            nav.append(InlineKeyboardButton("Старіші", callback_data=f"focus:{mode}:{page+1}"))
+            nav.append(InlineKeyboardButton("Старіші", callback_data=f"focus:{mode}:{choice}:{page+1}"))
         if nav:
             buttons.append(nav)
-        await query.message.reply_text("Обери тиждень:" if mode == "weeks" else "Обери дату:", reply_markup=InlineKeyboardMarkup(buttons))
+        buttons.append([InlineKeyboardButton("↩️ До періодів", callback_data=f"focus:menu:{choice}")])
+        await query.message.reply_text("Обери тиждень:" if mode == "weeks" else "Обери дату:",
+                                       reply_markup=InlineKeyboardMarkup(buttons))
+        return
+    if mode not in ("date", "week", "mtd"):
+        await query.message.reply_text("Невідомий режим. Відкрий /focus.")
         return
     day = datetime.strptime(max(dates) if mode == "mtd" else value, "%Y-%m-%d").date()
     if mode == "date" and value not in dates:
         await query.message.reply_text("Цієї дати вже немає. Відкрий /focus знову.")
         return
-    report = (focus_week_report(data, day) if mode == "week" else
-              focus_mtd_report(data, day) if mode == "mtd" else focus_date_report(data, day))
+    report = (focus_week_report(data, day, selected) if mode == "week" else
+              focus_mtd_report(data, day, selected) if mode == "mtd" else
+              focus_date_report(data, day, selected))
     await focus_send(query.message, report)
-
 
 
 async def sync_cmd(update, context):
@@ -1638,7 +1676,7 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("sync", sync_cmd, block=False))
     app.add_handler(CommandHandler("focus", focus_cmd))
-    app.add_handler(CallbackQueryHandler(focus_selected, pattern=r"^focus:(dates|weeks|date|week|mtd):"))
+    app.add_handler(CallbackQueryHandler(focus_selected, pattern=r"^focus:(menu|back|dates|weeks|date|week|mtd):"))
     app.add_handler(CommandHandler("day", day_cmd))
     app.add_handler(CallbackQueryHandler(day_selected, pattern=r"^day(page|date|pick):"))
     app.add_handler(CommandHandler("weeks", weeks_cmd))
