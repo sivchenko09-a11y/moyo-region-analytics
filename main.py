@@ -385,10 +385,21 @@ def weekly_report(end, store=None):
              "Останній повний: " + week_title(current_start),
              "", "Попередній → поточний | зміна"]
     for metric, label in WEEK_METRICS.items():
-        old, new = previous[metric], current[metric]
-        delta = new - old
-        relative = f"{delta / old * 100:+.2f}%" if old > 0 else "база для % відсутня або ≤ 0"
-        lines.append(f"• {label}: {fmt(old)} → {fmt(new)} | {delta:+,.0f} $ ({relative})".replace(",", " "))
+        lines.append(comparison_line(label, previous[metric], current[metric], money=True))
+    for name in sorted(store_sets[0]):
+        values = []
+        for segments in periods:
+            total = pd.Series(0.0, index=list(WEEK_METRICS))
+            for baseline, segment_end in segments:
+                frame = snapshots[segment_end]
+                total += frame[frame.store == name][list(WEEK_METRICS)].sum()
+                if baseline is not None:
+                    frame = snapshots[baseline]
+                    total -= frame[frame.store == name][list(WEEK_METRICS)].sum()
+            values.append(pd.DataFrame([total]))
+        actions = decline_actions(values[0], values[1], end, include_quality=False)
+        if actions:
+            lines.extend(["", f"План дій — {name}", "Цілі: повернення до рівня попереднього тижня.", *actions])
     return "\n".join(lines)
 
 
@@ -523,7 +534,7 @@ def daily_period(frames, start, end, store=None):
 def quality_summary(frame):
     totals = frame.sum(numeric_only=True)
     traffic = totals.traffic - totals.pudo
-    return {"Трафік без PUDO": traffic, "Чеки": totals.receipts,
+    return {"Трафік": traffic, "Чеки": totals.receipts,
             "КОП, %": totals.receipts / traffic * 100 if traffic else None,
             "Середній чек, $": totals.quality_sales / totals.receipts if totals.receipts else None,
             "КТЧ ≈": totals.estimated_items / totals.receipts if totals.receipts else None}
@@ -656,36 +667,70 @@ async def weeks_selected(update, context):
 
 
 
+def comparison_line(label, old, new, money=False):
+    if old is None or new is None or pd.isna(old) or pd.isna(new):
+        return f"⚪ {label}: немає бази для порівняння"
+    delta = new - old
+    icon = "🟢" if delta > 1e-9 else "🔴" if delta < -1e-9 else "⚪"
+    change = f"{delta / old * 100:+.2f}%" if old > 0 else "немає бази для %"
+    values = f"{fmt(old)} → {fmt(new)}" if money else f"{old:.2f} → {new:.2f}"
+    points = f"; {delta:+.2f} в.п." if label == "КОП, %" else ""
+    return f"{icon} {label}: {values} ({change}{points})"
+
+
+def decline_actions(before, after, end, include_quality=True):
+    # Targets restore the previous week's level; they are not forecasts.
+    actions = []
+    checkpoint = end + timedelta(days=3)
+    deadline = end + timedelta(days=7)
+    control = f"Контроль {checkpoint:%d.%m}: перевірка 5 чеків і консультацій; підсумок {deadline:%d.%m.%Y}."
+    tactics = {
+        "direct": ("Оборот прямий", "Керуючому виділити продавця для активних консультацій у пікові години та відпрацювати з командою пропозицію комплекту."),
+        "services": ("Послуги", "Керуючому відпрацювати з командою презентацію доречної послуги до основного товару; на контрольній точці розібрати причини відмов."),
+        "accessories": ("Аксесуари", "Керуючому сформувати комплекти аксесуарів до ходових моделей, перевірити наявність і закріпити пропозицію комплекту на консультації."),
+    }
+    for metric, (label, action) in tactics.items():
+        old, new = before[metric].sum(), after[metric].sum()
+        if new < old - 1e-9:
+            actions.append(f"🔴 {label}: {action} Ціль на наступний тиждень — {fmt(old)} (+{fmt(old-new)} до поточного). {control}")
+    if include_quality:
+        oldq, newq = quality_summary(before), quality_summary(after)
+        tactics_q = {
+            "КОП, %": ("КОП", "%", "Керуючому організувати парні консультації у пікові години та на контрольній точці розібрати 5 незавершених продажів."),
+            "Середній чек, $": ("Середній чек", " $", "Керуючому відпрацювати з продавцями презентацію дорожчої альтернативи й комплекту під потребу клієнта."),
+            "КТЧ ≈": ("КТЧ", "", "Керуючому підготувати по 2 доречні доповнення до ходових товарів та відпрацювати їх пропозицію в команді."),
+        }
+        for key, (label, unit, action) in tactics_q.items():
+            old, new = oldq[key], newq[key]
+            if old is not None and new is not None and new < old - 1e-9:
+                gap_unit = " в.п." if key == "КОП, %" else unit
+                actions.append(f"🔴 {label}: {action} Ціль на наступний тиждень — {old:.2f}{unit} (+{old-new:.2f}{gap_unit} до поточного). {control}")
+    return actions
+
+
 def daily_week(frames, end, store=None):
     end -= timedelta(days=(end.weekday()+1)%7)
     current = daily_period(frames, end-timedelta(days=6), end, store)
     previous = daily_period(frames, end-timedelta(days=13), end-timedelta(days=7), store)
     lines = [f"📊 {store or 'РЕГІОН'} — календарні тижні",
-             week_title(end-timedelta(days=13)) + " → " + week_title(end-timedelta(days=6)),
-             f"{end-timedelta(days=13):%d.%m}–{end-timedelta(days=7):%d.%m} → {end-timedelta(days=6):%d.%m}–{end:%d.%m.%Y}"]
-    for metric,label in WEEK_METRICS.items():
-        old,new = previous[metric].sum(),current[metric].sum()
-        change = f"{(new-old)/old*100:+.2f}%" if old>0 else "немає бази для %"
-        lines.append(f"• {label}: {fmt(old)} → {fmt(new)} ({change})")
-    oldq,newq = quality_summary(previous),quality_summary(current)
+             "Попередній: " + week_title(end-timedelta(days=13)),
+             "Поточний: " + week_title(end-timedelta(days=6)),
+             "Попередній → поточний | зміна"]
+    for metric, label in WEEK_METRICS.items():
+        lines.append(comparison_line(label, previous[metric].sum(), current[metric].sum(), money=True))
+    oldq, newq = quality_summary(previous), quality_summary(current)
     for label in oldq:
-        old,new=oldq[label],newq[label]
-        lines.append(f"• {label}: {old:.2f} → {new:.2f}" if old is not None and new is not None else f"• {label}: немає бази")
+        lines.append(comparison_line(label, oldq[label], newq[label]))
     for name in sorted(set(current.store)):
-        before=previous[previous.store==name]; after=current[current.store==name]
-        if after.direct.sum() >= before.direct.sum():
+        before, after = previous[previous.store == name], current[current.store == name]
+        if before.empty:
             continue
-        a,b=quality_summary(before),quality_summary(after)
-        lines.extend(["", f"План дій — {name} (прямі впали)"])
-        if a['КОП, %'] is not None and b['КОП, %'] is not None and b['КОП, %'] < a['КОП, %']:
-            effect=(a['КОП, %']-b['КОП, %'])/100*b['Трафік без PUDO']*(b['Середній чек, $'] or 0)
-            lines.append(f"• Керуючому організувати парні консультації у пікові години. Ціль КОП {a['КОП, %']:.2f}%, перевірка наступної неділі. Орієнтовний ефект за такого самого трафіку й чека: {fmt(effect)}.")
-        elif a['Середній чек, $'] is not None and b['Середній чек, $'] is not None and b['Середній чек, $'] < a['Середній чек, $']:
-            effect=(a['Середній чек, $']-b['Середній чек, $'])*b['Чеки']
-            lines.append(f"• Керуючому впровадити пропозицію комплекту та дорожчої альтернативи. Ціль середнього чека {a['Середній чек, $']:.2f} $, перевірка наступної неділі. Орієнтовний ефект за тієї самої кількості чеків: {fmt(effect)}.")
-        else:
-            lines.append("• Керуючому до середи перевірити причини зміни трафіку та наявність ходових товарів. За результатом обрати дію й ціль, перевірка наступної неділі. Для оцінки ефекту потрібні результати перевірки.")
+        actions = decline_actions(before, after, end)
+        if actions:
+            lines.extend(["", f"План дій — {name}",
+                          "Цілі: повернення до рівня попереднього тижня.", *actions])
     return "\n".join(lines)
+
 
 
 async def daily_command(update, context, mode):
