@@ -1,5 +1,6 @@
 import os
 import json
+from types import SimpleNamespace
 import calendar
 import re
 import io
@@ -9,9 +10,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
-from telegram import Update, BotCommand
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ConversationHandler,
+    Application, CommandHandler, MessageHandler, ConversationHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
 
@@ -284,6 +285,9 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def store_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
+    if not context.args:
+        await choose_store(update, "store")
+        return
     if await daily_command(update, context, "store"):
         return
     conn = db()
@@ -387,6 +391,9 @@ def weekly_report(end, store=None):
 
 async def week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
+        return
+    if not context.args:
+        await choose_store(update, "week")
         return
     if await daily_command(update, context, "week"):
         return
@@ -512,7 +519,6 @@ def daily_summary(frames, store=None):
             lines.extend([f"Факт виконання: {sales/plan*100:.2f}%", f"Тренд: {sales/end.day*calendar.monthrange(end.year,end.month)[1]/plan*100:.2f}%"])
     except ValueError as exc:
         lines.extend(["", "Місячний підсумок і тренд очікують повних даних.", str(exc)])
-    lines.append("КТЧ ≈ — зважено за чеками з округленого КТЧ у файлі. КОП — без PUDO.")
     return "\n".join(lines)
 
 
@@ -530,7 +536,6 @@ def daily_week(frames, end, store=None):
     for label in oldq:
         old,new=oldq[label],newq[label]
         lines.append(f"• {label}: {old:.2f} → {new:.2f}" if old is not None and new is not None else f"• {label}: немає бази")
-    lines.append("КТЧ ≈ — зважено за чеками. КОП — без PUDO.")
     for name in sorted(set(current.store)):
         before=previous[previous.store==name]; after=current[current.store==name]
         if after.direct.sum() >= before.direct.sum():
@@ -575,6 +580,43 @@ async def daily_command(update, context, mode):
     for offset in range(0,len(result),3500):
         await update.message.reply_text(result[offset:offset+3500])
     return True
+
+
+async def choose_store(update, mode):
+    frames = daily_frames()
+    if frames:
+        names = sorted(frames[max(frames)].store.tolist())
+    else:
+        conn = db()
+        try:
+            names = [row[0] for row in conn.execute(
+                "SELECT store FROM snapshots WHERE report_date = (SELECT MAX(report_date) FROM snapshots) ORDER BY store"
+            )]
+        finally:
+            conn.close()
+    if not names:
+        await update.message.reply_text("Спочатку надішли звіт.")
+        return
+    buttons = [[InlineKeyboardButton("Увесь регіон", callback_data=f"pick:{mode}:регіон")]]
+    buttons.extend([InlineKeyboardButton(name, callback_data=f"pick:{mode}:{name}")] for name in names)
+    await update.message.reply_text("Обери магазин або регіон:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def store_selected(update, context):
+    query = update.callback_query
+    if not is_owner(update):
+        await query.answer("Доступ лише власнику.", show_alert=True)
+        return
+    await query.answer()
+    _, mode, name = query.data.split(":", 2)
+    selected_update = SimpleNamespace(message=query.message, effective_user=update.effective_user)
+    context.args = [name]
+    if mode == "week":
+        await week_cmd(selected_update, context)
+    elif name == "регіон":
+        await report_cmd(selected_update, context)
+    else:
+        await store_cmd(selected_update, context)
 
 
 async def setup_commands(app):
@@ -692,6 +734,7 @@ def main():
     app.add_handler(CommandHandler("store", store_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("dates", dates_cmd))
+    app.add_handler(CallbackQueryHandler(store_selected, pattern=r"^pick:(store|week):"))
     app.add_handler(conv)
     app.add_handler(CommandHandler("cancel", cancel))
     app.run_polling()
