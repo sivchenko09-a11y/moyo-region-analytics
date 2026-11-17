@@ -226,7 +226,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Надішли файл XLSX, XLS або CSV з накопичувальними даними з 01 числа. "
         "У підписі вкажи дату зрізу, наприклад: 16.11.2026.\n"
         "Команда /status покаже останню збережену дату.\n"
-        "/focus — фокуси й категорії: дата, місяць до місяця, рік до року, тиждень до тижня.\n"
+        "/focus — фокуси й категорії: дата (MoM/YoY), тиждень та поточний місяць MTD.\n"
         "/weeks — обрати тиждень за номером без порівняння.\n"
         "/week — порівняти календарні тижні."
     )
@@ -1363,23 +1363,50 @@ def focus_change(old, new, unit):
     return f"{icon} {focus_value(old, unit)} → {focus_value(new, unit)}; {sign}{focus_value(abs(delta), unit)} ({change})"
 
 
+def focus_comparison_date(day, year, month):
+    """Same calendar day; nonexistent dates are not silently substituted."""
+    if day.day > calendar.monthrange(year, month)[1]:
+        return None
+    return day.replace(year=year, month=month)
+
+
 def focus_date_report(data, day):
+    previous_month = day.replace(day=1) - timedelta(days=1)
     lines = [f"🎯 Фокуси + категорії — РЕГІОН, {day:%d.%m.%Y}",
-             "Порівняння за однакову кількість днів із початку місяця."]
-    previous_month = day.replace(day=1)-timedelta(days=1)
+             "ЗА ОБРАНУ ДАТУ — порівняння аналогічних календарних дат."]
     for category, unit, _ in FOCUS_CONFIG.values():
-        month_total = focus_total(data, category, day.replace(day=1), day)
         daily = data.get((category, day.isoformat()))
-        lines.extend(["", category, f"За день: {focus_value(daily[1] if daily else None, unit)}",
-                      f"01–{day.day:02}: {focus_value(month_total, unit)}"])
-        for label, year, month in (("Місяць до місяця", previous_month.year, previous_month.month),
-                                   ("Рік до року", day.year-1, day.month)):
-            count = min(day.day, calendar.monthrange(year, month)[1])
-            old_end = day.replace(year=year, month=month, day=count)
-            current_end = day.replace(day=count)
-            old = focus_total(data, category, old_end.replace(day=1), old_end)
-            new = focus_total(data, category, day.replace(day=1), current_end)
-            lines.append(f"{label} (01–{count:02}.{month:02}.{year} → 01–{count:02}.{day.month:02}.{day.year}): " + focus_change(old,new,unit))
+        current = daily[1] if daily is not None else None
+        lines.extend(["", category, f"Факт {day:%d.%m.%Y}: {focus_value(current, unit)}"])
+        for label, year, month in (("MoM", previous_month.year, previous_month.month),
+                                   ("YoY", day.year - 1, day.month)):
+            comparison = focus_comparison_date(day, year, month)
+            if comparison is None:
+                lines.append(f"{label}: аналогічної календарної дати немає")
+                continue
+            old_row = data.get((category, comparison.isoformat()))
+            old = old_row[1] if old_row is not None else None
+            lines.append(f"{label} ({comparison:%d.%m.%Y} → {day:%d.%m.%Y}): " + focus_change(old, current, unit))
+    return "\n".join(lines)
+
+
+def focus_mtd_report(data, day):
+    """Month-to-date through the latest known date, compared over equal day counts."""
+    previous_month = day.replace(day=1) - timedelta(days=1)
+    lines = ["🎯 Фокуси + категорії — РЕГІОН · MTD",
+             f"Поточний період: {day.replace(day=1):%d.%m.%Y}–{day:%d.%m.%Y}",
+             "Порівняння накопичувальних показників за однакові календарні дні."]
+    for category, unit, _ in FOCUS_CONFIG.values():
+        current = focus_total(data, category, day.replace(day=1), day)
+        lines.extend(["", category, f"Факт MTD: {focus_value(current, unit)}"])
+        for label, year, month in (("MoM", previous_month.year, previous_month.month),
+                                   ("YoY", day.year - 1, day.month)):
+            if day.day > calendar.monthrange(year, month)[1]:
+                lines.append(f"{label}: немає рівного календарного періоду в {month:02d}.{year}")
+                continue
+            end = day.replace(year=year, month=month)
+            old = focus_total(data, category, end.replace(day=1), end)
+            lines.append(f"{label} (01.{month:02d}–{end:%d.%m.%Y} → 01.{day.month:02d}–{day:%d.%m.%Y}): " + focus_change(old, current, unit))
     return "\n".join(lines)
 
 
@@ -1417,7 +1444,8 @@ async def focus_cmd(update, context):
         return
     await update.message.reply_text("🎯 Фокуси + категорії — регіон\nОбери перегляд:", reply_markup=InlineKeyboardMarkup([
         [InlineKeyboardButton("📅 За датою · місяць і рік", callback_data="focus:dates:0")],
-        [InlineKeyboardButton("📊 Тиждень до тижня", callback_data="focus:weeks:0")]]))
+        [InlineKeyboardButton("📊 Тиждень до тижня", callback_data="focus:weeks:0")],
+        [InlineKeyboardButton("📈 Поточний місяць · MTD", callback_data="focus:mtd:latest")]]))
 
 
 async def focus_selected(update, context):
@@ -1453,11 +1481,12 @@ async def focus_selected(update, context):
             buttons.append(nav)
         await query.message.reply_text("Обери тиждень:" if mode == "weeks" else "Обери дату:", reply_markup=InlineKeyboardMarkup(buttons))
         return
-    day = datetime.strptime(value, "%Y-%m-%d").date()
+    day = datetime.strptime(max(dates) if mode == "mtd" else value, "%Y-%m-%d").date()
     if mode == "date" and value not in dates:
         await query.message.reply_text("Цієї дати вже немає. Відкрий /focus знову.")
         return
-    report = focus_week_report(data, day) if mode == "week" else focus_date_report(data, day)
+    report = (focus_week_report(data, day) if mode == "week" else
+              focus_mtd_report(data, day) if mode == "mtd" else focus_date_report(data, day))
     await focus_send(query.message, report)
 
 
@@ -1609,7 +1638,7 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("sync", sync_cmd, block=False))
     app.add_handler(CommandHandler("focus", focus_cmd))
-    app.add_handler(CallbackQueryHandler(focus_selected, pattern=r"^focus:(dates|weeks|date|week):"))
+    app.add_handler(CallbackQueryHandler(focus_selected, pattern=r"^focus:(dates|weeks|date|week|mtd):"))
     app.add_handler(CommandHandler("day", day_cmd))
     app.add_handler(CallbackQueryHandler(day_selected, pattern=r"^day(page|date|pick):"))
     app.add_handler(CommandHandler("weeks", weeks_cmd))
