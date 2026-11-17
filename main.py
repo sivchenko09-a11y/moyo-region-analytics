@@ -282,7 +282,7 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     previous = get_snapshot(prev_date) if prev_date else None
     report = make_report(report_date, current, previous, prev_date)
     for offset in range(0, len(report), 4000):
-        await update.message.reply_text(report[offset:offset + 4000])
+        await update.message.reply_text(bold_report_percentages(report[offset:offset + 4000]), parse_mode="HTML")
 
 async def store_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
@@ -324,7 +324,7 @@ async def store_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         previous = previous[previous["store"] == store].copy()
     report = make_report(report_date, current, previous, prev_date)
     report = report.replace(f"📊 РЕГІОН — {report_date}", f"📊 {store} — {report_date}", 1)
-    await update.message.reply_text(report)
+    await update.message.reply_text(bold_report_percentages(report), parse_mode="HTML")
 
 WEEK_METRICS = {
     "sales": "Продажі", "direct": "Прямі", "pickup": "Пікап",
@@ -451,7 +451,7 @@ async def week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(message)
             return
         store = matches[0]
-    await update.message.reply_text(weekly_report(end, store))
+    await update.message.reply_text(bold_report_percentages(weekly_report(end, store)), parse_mode="HTML")
 
 
 def daily_db():
@@ -709,7 +709,7 @@ async def weeks_selected(update, context):
     except ValueError as exc:
         report = str(exc)
     for offset in range(0, len(report), 3500):
-        await query.message.reply_text(report[offset:offset+3500])
+        await query.message.reply_text(bold_report_percentages(report[offset:offset+3500]), parse_mode="HTML")
 
 
 
@@ -953,7 +953,7 @@ async def daily_command(update, context, mode):
     except ValueError as exc:
         result=str(exc)
     for offset in range(0,len(result),3500):
-        await update.message.reply_text(result[offset:offset+3500])
+        await update.message.reply_text(bold_report_percentages(result[offset:offset+3500]), parse_mode="HTML")
     return True
 
 
@@ -1080,7 +1080,7 @@ async def day_selected(update, context):
         except ValueError as exc:
             report = str(exc)
         for offset in range(0, len(report), 3500):
-            await query.message.reply_text(report[offset:offset+3500])
+            await query.message.reply_text(bold_report_percentages(report[offset:offset+3500]), parse_mode="HTML")
 
 
 SALES_SHEET_ID = "1JmXrIBABlzrUFG5IsOgjTD_rG7zbAzvdLBnB4FDlqnE"
@@ -1499,6 +1499,13 @@ def focus_week_report(data, monday, selected=None):
     return "\n".join(lines)
 
 
+def bold_report_percentages(report):
+    """Escape report text and bold every numeric percentage for Telegram HTML."""
+    import html
+    escaped = html.escape(str(report))
+    return re.sub(r"(?<![\\w])([+−-]?\\d+(?:[.,]\\d+)?%)", r"<b>\\1</b>", escaped)
+
+
 async def focus_send(message, report):
     # Telegram HTML: bold percentage changes only, not the rest of the comparison.
     import html
@@ -1623,7 +1630,7 @@ async def sync_cmd(update, context):
     finally:
         context.bot_data["sync_running"] = False
     for offset in range(0, len(result), 3500):
-        await update.message.reply_text(result[offset:offset+3500])
+        await update.message.reply_text(bold_report_percentages(result[offset:offset+3500]), parse_mode="HTML")
 
 
 async def setup_commands(app):
@@ -1701,7 +1708,7 @@ async def process_file(update, context, file_id, filename, report_date):
             await update.message.reply_text("Звіт збережено: продажі накопичувально, якісні за день. Повторне завантаження за цю дату замінює дані.")
             result = daily_summary({day: frame for day, frame in daily_frames().items() if day <= report_date})
             for offset in range(0, len(result), 3500):
-                await update.message.reply_text(result[offset:offset+3500])
+                await update.message.reply_text(bold_report_percentages(result[offset:offset+3500]), parse_mode="HTML")
             return ConversationHandler.END
         current = read_report(raw, filename)
         if current.empty:
@@ -1710,7 +1717,7 @@ async def process_file(update, context, file_id, filename, report_date):
         previous = get_snapshot(prev_date) if prev_date else None
         save_snapshot(report_date, current)
         report = make_report(report_date, current, previous, prev_date)
-        await update.message.reply_text(report)
+        await update.message.reply_text(bold_report_percentages(report), parse_mode="HTML")
     except Exception as exc:
         log.exception("Failed to process report")
         await update.message.reply_text(
