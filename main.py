@@ -1289,8 +1289,10 @@ def parse_focus_sheets(sheets):
                             amount = float(re.sub(r"\s+", "", str(amount_raw)).replace(",", "."))
                         except (ValueError, TypeError):
                             raise ValueError(f"Фокуси: {title}, {date} — некоректна сума.")
-                        if not math.isfinite(amount) or amount < 0:
-                            raise ValueError(f"Фокуси: {title}, {date} — перевір суму.")
+                        # Negative monetary values are valid: refunds/corrections
+                        # can make the day's net amount negative.
+                        if not math.isfinite(amount):
+                            raise ValueError(f"Фокуси: {title}, {date} — сума не є скінченним числом.")
                         amount_identity = (category + " · сума", date)
                         if amount_identity in result:
                             raise ValueError(f"Фокуси: повтор суми {category} за {date}.")
