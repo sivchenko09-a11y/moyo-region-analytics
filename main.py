@@ -1794,7 +1794,18 @@ def group_report_text(day):
     data = focus_data()
     if not data or not any(d == key for _, d in data):
         raise ValueError(f"Немає фокусів за {day:%d.%m.%Y}.")
-    lines.extend(["", focus_date_report(data, day)])
+    # Group digest: only ЕЗ and Клімат, with year-over-year comparison.
+    # Interactive /focus reports remain unchanged.
+    lines.extend(["", "🎯 ФОКУСИ ЗА ВЧОРА — ЕЗ / КЛІМАТ"])
+    for category in ("ЕЗ", "Клімат"):
+        unit = FOCUS_CONFIG[category][1]
+        lines.extend(["", category, f"Факт: {focus_pair(data, category, unit, day, day)}"])
+        previous_year = focus_comparison_date(day, day.year - 1, day.month)
+        if previous_year is None:
+            lines.append("Рік до Року: немає аналогічної календарної дати")
+        else:
+            lines.append("Рік до Року: " + focus_pair_change(
+                data, category, unit, previous_year, previous_year, day, day))
     return "\n".join(lines)
 
 def digest_db():
