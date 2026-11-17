@@ -1503,7 +1503,7 @@ def bold_report_percentages(report):
     """Escape report text and bold every numeric percentage for Telegram HTML."""
     import html
     escaped = html.escape(str(report))
-    return re.sub(r"(?<![\\w])([+−-]?\\d+(?:[.,]\\d+)?%)", r"<b>\\1</b>", escaped)
+    return re.sub(r"(?<![\w])([+−-]?\d+(?:[.,]\d+)?%)", r"<b>\1</b>", escaped)
 
 
 async def focus_send(message, report):
