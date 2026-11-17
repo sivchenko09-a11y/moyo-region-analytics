@@ -2413,7 +2413,7 @@ def interim_dashboard(report_day, slot, rate, data):
         if p is not None and p>0: rect(x+20,446,x+20+(cw-40)*min(p,100)/100,461,accent,8)
         if k!='sales':
             share=100*totals[k]/totals['sales'] if totals['sales'] else 0
-            txt(x+cw-22,465,f'ЧАСТКА В ОБОРОТІ  {share:.2f}%',21,navy,True,'ra')
+            txt(x+cw-22,468,f'Частка в обороті: {share:.2f}%',19,navy,True,'ra')
     rect(14,511,W-14,1505,'white',20)
     txt(36,526,'МАГАЗИНИ — ВИКОНАННЯ ПЛАНУ',34,navy,True)
     # Widths: store 248; turnover 405; accessories 505; services 505
@@ -2422,7 +2422,7 @@ def interim_dashboard(report_day, slot, rate, data):
     txt(43,621,'Магазин',22,'white',True)
     for mid,name in ((480,'ОБОРОТ'),(931,'АКСЕСУАРИ'),(1426,'ПОСЛУГИ')):
         txt(mid,595,name,23,'white',True,'ma')
-    columns=[(379,'План'),(497,'Факт'),(618,'%'),(789,'План'),(906,'Факт'),(1011,'%'),(1160,'Частка'),(1287,'План'),(1395,'Факт'),(1508,'%'),(1652,'Частка')]
+    columns=[(380,'План'),(500,'Факт'),(635,'%'),(786,'План'),(905,'Факт'),(1052,'%'),(1160,'Частка'),(1280,'План'),(1390,'Факт'),(1538,'%'),(1650,'Частка')]
     for x,label in columns: txt(x,645,label,18,'#dcecff',True,'ra')
     for x in boundaries[1:-1]: d.line((x,587,x,1490),fill='#d0dce9',width=2)
     short={'Буча-Рітейл Парк':'Буча-Рітейл','Київ-Аладдін':'Аладін','Київ-Аркадія':'Аркадія','Київ-Блокбастер':'Блокбастер','Київ-Дрімтаун_new':'Дрім Таун','Київ-Квадрат':'Квадрат','Київ-Комод':'Комод','Київ-Лавіна Молл':'Лавіна','Київ-Материк':'Материк','Київ-Нью Вей':'Нью Вей','Київ-Олімпійський':'Олімпійський','Київ-Республіка Парк':'Республіка Парк','Київ-Ретровіль':'Ретровіль','Київ-Хрещатик 21':'Хрещатик 21'}
@@ -2431,12 +2431,12 @@ def interim_dashboard(report_day, slot, rate, data):
         y=690+i*rowh
         if i%2==0: rect(30,y,1670,y+rowh-2,'#eef5fd',5)
         txt(43,y+13,short.get(store,store),21,navy,True)
-        for k,xp,xf,xe,xs in (('sales',379,497,527,None),('accessories',789,906,917,1160),('services',1287,1395,1414,1652)):
+        for k,xp,xf,xe,xs in (('sales',380,500,556,None),('accessories',786,905,973,1160),('services',1280,1390,1458,1650)):
             pp=perf(vals[k],plan[k]); share=100*vals[k]/vals['sales'] if vals['sales'] else 0
             txt(xp,y+14,money(plan[k]) if plan[k] is not None else '—',19,navy,True,'ra')
             txt(xf,y+14,money(vals[k]),20,navy,True,'ra')
             if pp is not None:
-                badge_x=xe-13
+                badge_x=xe
                 rect(badge_x,y+8,badge_x+90,y+44,
                      '#dff7e9' if pp>=100 else '#fff1ce' if pp>=70 else '#ffe3e8',9)
                 txt(badge_x+45,y+11,pct(pp),20,color(pp),True,'ma')
@@ -2444,10 +2444,10 @@ def interim_dashboard(report_day, slot, rate, data):
     yy=690+14*rowh+5
     rect(30,yy,1670,yy+53,navy,8)
     txt(43,yy+13,'РАЗОМ',20,'white',True)
-    for k,xp,xf,xe,xs in (('sales',379,497,527,None),('accessories',789,906,917,1160),('services',1287,1395,1414,1652)):
+    for k,xp,xf,xe,xs in (('sales',380,500,556,None),('accessories',786,905,973,1160),('services',1280,1390,1458,1650)):
         txt(xp,yy+13,money(targets[k]) if targets[k] is not None else '—',19,'white',True,'ra')
         txt(xf,yy+13,money(totals[k]),20,'white',True,'ra')
-        txt(xe+91,yy+13,pct(perf(totals[k],targets[k])),20,'#b9f2d6',True,'ra')
+        txt(xe+82,yy+13,pct(perf(totals[k],targets[k])),20,'#b9f2d6',True,'ra')
         if xs is not None: txt(xs,yy+13,f'{100*totals[k]/totals["sales"] if totals["sales"] else 0:.1f}%',19,'white',True,'ra')
     rect(14,1522,837,1816,'white',20); rect(851,1522,1686,1816,'white',20)
     rect(30,1539,822,1598,'#dcf6e9',13); rect(866,1539,1670,1598,'#fbe5e8',13)
