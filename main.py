@@ -1638,6 +1638,7 @@ async def setup_commands(app):
     await app.bot.set_my_commands([
         BotCommand("focus", "🎯 Фокуси + категорії"),
         BotCommand("group_test", "Тест відправки у групу"),
+        BotCommand("interim_test", "Тест проміжкового звіту 1С"),
         BotCommand("group_here", "Дізнатись ID групи"),
         BotCommand("sync", "Оновити дані з Google Таблиць"),
         BotCommand("day", "Обрати дату та магазин або регіон"),
@@ -2476,15 +2477,45 @@ def interim_db():
     conn.execute('CREATE TABLE IF NOT EXISTS interim_sent (day TEXT, slot INTEGER, chat_id TEXT, signature TEXT, PRIMARY KEY(day,slot,chat_id))')
     return conn
 
+async def interim_test(update, context):
+    """Manual preview for today; never marks either scheduled slot as sent."""
+    if not is_owner(update):
+        return
+    day = datetime.now(REPORT_TZ).date()
+    chat_id = update.effective_chat.id
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🔄 Читаю проміжкові продажі 1С за {day:%d.%m.%Y}…"
+        )
+        # Refresh monthly plans, so the image uses the newest plan figures.
+        await asyncio.to_thread(sync_google_sheets)
+        rate, data, _ = await asyncio.to_thread(fetch_interim_sheet, day)
+        slot = 21 if datetime.now(REPORT_TZ).hour >= 21 else 18 if datetime.now(REPORT_TZ).hour >= 18 else 15
+        picture = await asyncio.to_thread(interim_dashboard, day, slot, rate, data)
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=picture,
+            caption=f"🧪 ТЕСТ • МОЙО — проміжковий звіт за {day:%d.%m.%Y} "
+                    f"(курс {rate:g} грн/$). Автоматичні відправки не змінено."
+        )
+    except Exception as exc:
+        log.exception("Manual interim test failed")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"❌ Проміжковий тест не сформовано: {exc}"
+        )
+
+
 async def interim_loop(app):
-    """Poll once per minute, send once per slot after two identical reads."""
+    """Poll once per minute for 15:00, 18:00, and 21:00 slots."""
     previous=None
     while True:
         await asyncio.sleep(60)
         if not GROUP_CHAT_ID:
             continue
         now=datetime.now(REPORT_TZ)
-        slot=21 if now.hour>=21 else 15 if now.hour>=15 else None
+        slot=21 if now.hour>=21 else 18 if now.hour>=18 else 15 if now.hour>=15 else None
         if slot is None:
             previous=None
             continue
@@ -2493,8 +2524,11 @@ async def interim_loop(app):
         try:
             already=conn.execute('SELECT signature FROM interim_sent WHERE day=? AND slot=? AND chat_id=?',
                                  (day.isoformat(),slot,str(GROUP_CHAT_ID))).fetchone()
-            earlier=conn.execute('SELECT signature FROM interim_sent WHERE day=? AND slot=15 AND chat_id=?',
-                                 (day.isoformat(),str(GROUP_CHAT_ID))).fetchone() if slot==21 else None
+            earlier=conn.execute('SELECT signature FROM interim_sent WHERE day=? AND slot=? AND chat_id=?',
+                                 (day.isoformat(),15 if slot==18 else 18,str(GROUP_CHAT_ID))).fetchone() if slot in (18,21) else None
+            if slot==21 and not earlier:
+                earlier=conn.execute('SELECT signature FROM interim_sent WHERE day=? AND slot=15 AND chat_id=?',
+                                     (day.isoformat(),str(GROUP_CHAT_ID))).fetchone()
         finally: conn.close()
         if already:
             continue
@@ -2542,6 +2576,7 @@ def main():
     )
     app.add_handler(CommandHandler("group_here", group_here))
     app.add_handler(CommandHandler("group_test", group_test))
+    app.add_handler(CommandHandler("interim_test", interim_test))
     app.add_handler(CommandHandler("group_week_test", group_week_test))
     app.add_handler(CommandHandler("group_month_test", group_month_test))
     app.add_handler(CommandHandler("start", start))
