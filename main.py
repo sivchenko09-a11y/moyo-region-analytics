@@ -188,14 +188,11 @@ def make_report(report_date, current, previous, previous_date):
     lines += ["", f"НАКОПИЧУВАЛЬНО З 01.{report_day.month:02d}"]
     for m in metrics:
         lines.append(f"• {labels[m]}: {fmt(totals[m])}")
-    if plan:
-        lines += [
-            f"• План місяця: {fmt(plan)}",
-            f"• Факт виконання плану: {pct(totals['sales'], plan):.2f}%",
-            f"• Тренд виконання: {pct(totals['sales'] / report_day.day * days_in_month, plan):.2f}%",
-            f"• Прогноз продажів за місяць: {fmt(totals['sales'] / report_day.day * days_in_month)}",
-            "Тренд за поточним середньоденним темпом, включно з датою звіту.",
-        ]
+    trend_frame = current.copy()
+    for metric in PLAN_COLUMNS:
+        trend_frame["cumulative_" + metric] = trend_frame[metric]
+    trend_store = trend_frame.iloc[0].store if len(trend_frame) == 1 else None
+    lines.extend(monthly_trend_lines({report_date: trend_frame}, trend_store))
 
     if prev is not None:
         lines += ["", "ПРИРІСТ ПРОДАЖІВ ПО МАГАЗИНАХ"]
@@ -567,11 +564,7 @@ def daily_summary(frames, store=None):
             lines.append(f"• {label}: {fmt(day[metric].sum())}")
     for label, value in quality_summary(day).items():
         lines.append(f"• {label}: {value:.2f}" if value is not None else f"• {label}: немає бази")
-    sales = day.cumulative_sales.sum()
-    plan = day.plan.sum()
-    lines.extend(["", f"Продажі з початку місяця: {fmt(sales)}", f"План місяця: {fmt(plan)}"])
-    if plan > 0:
-        lines.extend([f"Факт виконання: {sales/plan*100:.2f}%", f"Тренд: {sales/end.day*calendar.monthrange(end.year,end.month)[1]/plan*100:.2f}%"])
+    lines.extend(monthly_trend_lines(frames, store))
     return "\n".join(lines)
 
 
@@ -601,6 +594,7 @@ def single_week_report(frames, monday, store=None):
         lines.append(f"• {label}: {value}")
     for label, value in quality_summary(frame).items():
         lines.append(f"• {label}: {value:.2f}" if value is not None else f"• {label}: немає бази")
+    lines.extend(monthly_trend_lines(frames, store))
     return "\n".join(lines)
 
 
@@ -842,6 +836,54 @@ def daily_week(frames, end, store=None):
 
 
 
+def monthly_store_summary(frames, store=None, plans=None):
+    latest = max(frames)
+    end = datetime.strptime(latest, "%Y-%m-%d").date()
+    start = end.replace(day=1)
+    current = frames[latest]
+    if store:
+        current = current[current.store == store]
+    if current.empty:
+        raise ValueError("Магазин відсутній у звіті за останню завантажену дату.")
+    lines = [f"📊 {store or 'РЕГІОН'} — З ПОЧАТКУ МІСЯЦЯ",
+             f"{start:%d.%m.%Y}–{end:%d.%m.%Y}"]
+    trend = monthly_trend_lines(frames, store, plans)
+    lines.extend(trend[1:])
+    sales = current.cumulative_sales.sum()
+    lines.extend(["", "Продажі за місяць:"])
+    for metric, label in (("direct", "Прямий оборот"), ("pickup", "Пікап")):
+        value = current["cumulative_" + metric].sum()
+        share = f"; частка {value/sales*100:.2f}%" if sales else ""
+        lines.append(f"• {label}: {fmt(value)}{share}")
+    for metric, label in (("accessories", "Частка аксесуарів"), ("services", "Частка послуг")):
+        value = current["cumulative_" + metric].sum()
+        lines.append(f"• {label}: {value/sales*100:.2f}%" if sales else f"• {label}: немає бази")
+    lines.extend(["", "Якісні показники з початку місяця:"])
+    selected, missing = [], []
+    expected_names = set(current.store)
+    for offset in range(end.day):
+        day = (start + timedelta(days=offset)).isoformat()
+        frame = frames.get(day)
+        if frame is None:
+            missing.append(day)
+            continue
+        if store:
+            frame = frame[frame.store == store]
+        if frame.empty or set(frame.store) != expected_names:
+            missing.append(day)
+            continue
+        selected.append(frame)
+    if missing:
+        lines.append("Не розраховано за повний період: бракує звітів або магазинів за " + ", ".join(missing) + ".")
+    else:
+        # Quality columns are daily: aggregate totals, then calculate weighted ratios.
+        quality = quality_summary(pd.concat(selected, ignore_index=True))
+        for label, value in quality.items():
+            lines.append(f"• {label}: {value:.2f}" if value is not None else f"• {label}: немає бази")
+    return "\n".join(lines)
+
+
+
 async def daily_command(update, context, mode):
     frames=daily_frames()
     if not frames:
@@ -862,6 +904,8 @@ async def daily_command(update, context, mode):
             result='Приклад: /store Материк\n'+'\n'.join(frames[max(frames)].store)
         elif mode=='week':
             result=daily_week(frames,end,store)
+        elif mode=='store':
+            result=monthly_store_summary(frames,store)
         else:
             result=daily_summary(frames,store)
     except ValueError as exc:
@@ -903,7 +947,8 @@ async def store_selected(update, context):
     if mode == "week":
         await week_cmd(selected_update, context)
     elif name == "регіон":
-        await report_cmd(selected_update, context)
+        if not await daily_command(selected_update, context, "store"):
+            await report_cmd(selected_update, context)
     else:
         await store_cmd(selected_update, context)
 
@@ -1144,7 +1189,7 @@ async def setup_commands(app):
         BotCommand("day", "Обрати дату та магазин або регіон"),
         BotCommand("weeks", "Тиждень за номером без порівняння"),
         BotCommand("week", "Порівняння календарних тижнів Пн–Нд"),
-        BotCommand("store", "Показники конкретного магазину"),
+        BotCommand("store", "Магазин за місяць: план, факт і тренд"),
         BotCommand("report", "Останній звіт і тренд регіону"),
         BotCommand("dates", "Збережені дати та кількість магазинів"),
         BotCommand("status", "Дата останнього звіту"),
