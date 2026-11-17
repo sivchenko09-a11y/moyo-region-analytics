@@ -227,7 +227,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Надішли файл XLSX, XLS або CSV з накопичувальними даними з 01 числа. "
         "У підписі вкажи дату зрізу, наприклад: 16.11.2026.\n"
-        "Команда /status покаже останню збережену дату."
+        "Команда /status покаже останню збережену дату.\n"
+        "/weeks — обрати тиждень за номером без порівняння.\n"
+        "/week — порівняти календарні тижні."
     )
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -379,8 +381,8 @@ def weekly_report(end, store=None):
         totals.append(total)
     previous, current = totals
     lines = [f"📊 ТИЖДЕНЬ ДО ТИЖНЯ — {store or 'РЕГІОН'}",
-             f"Попередній календарний тиждень: {previous_start:%d.%m.%Y}–{previous_end:%d.%m.%Y}",
-             f"Останній повний календарний тиждень: {current_start:%d.%m.%Y}–{end:%d.%m.%Y}",
+             "Попередній: " + week_title(previous_start),
+             "Останній повний: " + week_title(current_start),
              "", "Попередній → поточний | зміна"]
     for metric, label in WEEK_METRICS.items():
         old, new = previous[metric], current[metric]
@@ -551,11 +553,115 @@ def daily_summary(frames, store=None):
     return "\n".join(lines)
 
 
+def week_title(start):
+    year, number, _ = start.isocalendar()
+    end = start + timedelta(days=6)
+    return f"Тиждень {number} ({year}) · {start:%d.%m.%Y}–{end:%d.%m.%Y}"
+
+
+def single_week_report(frames, monday, store=None):
+    sunday = monday + timedelta(days=6)
+    dates = sorted(day for day in frames if monday.isoformat() <= day <= sunday.isoformat())
+    if not dates:
+        return "За цей тиждень даних немає. Онови їх через /sync."
+    start = datetime.strptime(dates[0], "%Y-%m-%d").date()
+    end = datetime.strptime(dates[-1], "%Y-%m-%d").date()
+    lines = [f"📊 {store or 'РЕГІОН'}", week_title(monday)]
+    if len(dates) < 7:
+        lines.append(f"Неповний тиждень: дані за {start:%d.%m}–{end:%d.%m.%Y} ({len(dates)} із 7 днів).")
+    frame = daily_period(frames, start, end, store)
+    for metric, label in WEEK_METRICS.items():
+        lines.append(f"• {label}: {fmt(frame[metric].sum())}")
+    sales = frame.sales.sum()
+    for metric, label in (("direct", "Частка прямих"), ("pickup", "Частка пікап"),
+                          ("accessories", "Частка аксесуарів"), ("services", "Частка послуг")):
+        value = f"{frame[metric].sum() / sales * 100:.2f}%" if sales else "немає бази"
+        lines.append(f"• {label}: {value}")
+    for label, value in quality_summary(frame).items():
+        lines.append(f"• {label}: {value:.2f}" if value is not None else f"• {label}: немає бази")
+    return "\n".join(lines)
+
+
+async def weeks_menu(message, page=0):
+    frames = daily_frames()
+    mondays = sorted({(datetime.strptime(day, "%Y-%m-%d").date() -
+                       timedelta(days=datetime.strptime(day, "%Y-%m-%d").weekday()))
+                      for day in frames}, reverse=True)
+    if not mondays:
+        await message.reply_text("Спочатку онови дані через /sync.")
+        return
+    page = min(max(page, 0), (len(mondays)-1)//12)
+    buttons = [[InlineKeyboardButton(week_title(day), callback_data=f"wsdate:{day.isoformat()}")]
+               for day in mondays[page*12:(page+1)*12]]
+    nav = []
+    if page:
+        nav.append(InlineKeyboardButton("Новіші", callback_data=f"wspage:{page-1}"))
+    if (page+1)*12 < len(mondays):
+        nav.append(InlineKeyboardButton("Старіші", callback_data=f"wspage:{page+1}"))
+    if nav:
+        buttons.append(nav)
+    await message.reply_text("Обери тиждень (Пн–Нд):", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def weeks_cmd(update, context):
+    if is_owner(update):
+        await weeks_menu(update.message)
+
+
+async def weeks_selected(update, context):
+    query = update.callback_query
+    if not is_owner(update):
+        await query.answer("Доступ лише власнику.", show_alert=True)
+        return
+    await query.answer()
+    action, value = query.data.split(":", 1)
+    if action == "wspage":
+        await weeks_menu(query.message, int(value))
+        return
+    frames = daily_frames()
+    if action == "wsdate":
+        monday = datetime.strptime(value, "%Y-%m-%d").date()
+        sunday = monday + timedelta(days=6)
+        names = sorted({name for day, frame in frames.items()
+                        if value <= day <= sunday.isoformat() for name in frame.store})
+        if not names:
+            await query.message.reply_text("Даних немає. Відкрий /weeks знову.")
+            return
+        import uuid
+        menu_id = uuid.uuid4().hex[:12]
+        menus = context.user_data.setdefault("week_menus", {})
+        menus[menu_id] = (value, names)
+        if len(menus) > 50:
+            del menus[next(iter(menus))]
+        buttons = [[InlineKeyboardButton("Увесь регіон", callback_data=f"wspick:{menu_id}:-1")]]
+        buttons.extend([InlineKeyboardButton(name, callback_data=f"wspick:{menu_id}:{index}")]
+                       for index, name in enumerate(names))
+        await query.message.reply_text(week_title(monday) + "\nОбери магазин або регіон:",
+                                       reply_markup=InlineKeyboardMarkup(buttons))
+        return
+    menu_id, index = value.split(":")
+    menu = context.user_data.get("week_menus", {}).get(menu_id)
+    index = int(index)
+    if menu is None or index < -1 or index >= len(menu[1]):
+        await query.message.reply_text("Відкрий вибір тижня знову через /weeks.")
+        return
+    monday = datetime.strptime(menu[0], "%Y-%m-%d").date()
+    try:
+        report = single_week_report(frames, monday, menu[1][index] if index >= 0 else None)
+    except ValueError as exc:
+        report = str(exc)
+    for offset in range(0, len(report), 3500):
+        await query.message.reply_text(report[offset:offset+3500])
+
+
+
+
 def daily_week(frames, end, store=None):
     end -= timedelta(days=(end.weekday()+1)%7)
     current = daily_period(frames, end-timedelta(days=6), end, store)
     previous = daily_period(frames, end-timedelta(days=13), end-timedelta(days=7), store)
     lines = [f"📊 {store or 'РЕГІОН'} — календарні тижні",
+             week_title(end-timedelta(days=13)) + " → " + week_title(end-timedelta(days=6)),
              f"{end-timedelta(days=13):%d.%m}–{end-timedelta(days=7):%d.%m} → {end-timedelta(days=6):%d.%m}–{end:%d.%m.%Y}"]
     for metric,label in WEEK_METRICS.items():
         old,new = previous[metric].sum(),current[metric].sum()
@@ -845,6 +951,7 @@ async def setup_commands(app):
     await app.bot.set_my_commands([
         BotCommand("sync", "Оновити дані з Google Таблиць"),
         BotCommand("day", "Обрати дату та магазин або регіон"),
+        BotCommand("weeks", "Тиждень за номером без порівняння"),
         BotCommand("week", "Порівняння календарних тижнів Пн–Нд"),
         BotCommand("store", "Показники конкретного магазину"),
         BotCommand("report", "Останній звіт і тренд регіону"),
@@ -957,6 +1064,8 @@ def main():
     app.add_handler(CommandHandler("sync", sync_cmd, block=False))
     app.add_handler(CommandHandler("day", day_cmd))
     app.add_handler(CallbackQueryHandler(day_selected, pattern=r"^day(page|date|pick):"))
+    app.add_handler(CommandHandler("weeks", weeks_cmd))
+    app.add_handler(CallbackQueryHandler(weeks_selected, pattern=r"^ws(page|date|pick):"))
     app.add_handler(CommandHandler("week", week_cmd))
     app.add_handler(CommandHandler("store", store_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
