@@ -17,6 +17,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 TOKEN = os.getenv("BOT_TOKEN")
@@ -34,7 +35,7 @@ STORE_ORDER = [
 
 ALIASES = {
     "store": ["Склад", "Магазин", "ТТ"],
-    "sales": ["Продажи", "Продажі", "Продажи $", "Продажі $"],
+    "sales": ["Продажи", "Продажі", "Продажи $", "Продажі $", "Продажи, $", "Продажі, $"],
     "py": ["ПродажиPY", "ПродажіPY", "Продажи PY", "Продажі PY"],
     "direct": ["Прямые Продажи", "Прямі Продажі", "Прямые продажи"],
     "pickup": ["Пикап", "Пікап"],
@@ -57,7 +58,7 @@ def find_col(df, aliases, required=True):
 
 def to_num(series):
     return pd.to_numeric(
-        series.astype(str).str.replace(" ", "", regex=False)
+        series.astype(str).str.replace(r"\s+", "", regex=True)
               .str.replace(",", ".", regex=False)
               .str.replace("$", "", regex=False),
         errors="coerce"
@@ -66,15 +67,26 @@ def to_num(series):
 def read_report(raw: bytes, filename: str) -> pd.DataFrame:
     suffix = Path(filename).suffix.lower()
     if suffix in (".xlsx", ".xls"):
-        df = pd.read_excel(io.BytesIO(raw))
+        df = pd.read_excel(io.BytesIO(raw), header=None)
     elif suffix == ".csv":
         try:
-            df = pd.read_csv(io.BytesIO(raw), sep=None, engine="python", encoding="utf-8-sig")
+            df = pd.read_csv(io.BytesIO(raw), sep=None, engine="python", header=None, encoding="utf-8-sig")
         except UnicodeDecodeError:
-            df = pd.read_csv(io.BytesIO(raw), sep=None, engine="python", encoding="cp1251")
+            df = pd.read_csv(io.BytesIO(raw), sep=None, engine="python", header=None, encoding="cp1251")
     else:
         raise ValueError("Підтримуються лише XLSX, XLS та CSV.")
-    df.columns = [str(c).strip() for c in df.columns]
+    header_row = None
+    for index, row in df.iterrows():
+        values = {norm(value) for value in row if pd.notna(value)}
+        if (values.intersection(map(norm, ALIASES["store"]))
+                and values.intersection(map(norm, ALIASES["sales"]))):
+            header_row = index
+            break
+    if header_row is None:
+        raise ValueError("Не знайшов заголовки магазину та продажів у таблиці.")
+    df.columns = [str(c).strip() for c in df.loc[header_row]]
+    df = df.loc[header_row + 1:].copy()
+    df = df.dropna(subset=[find_col(df, ALIASES["store"])])
 
     cols = {
         key: find_col(df, aliases, required=(key != "plan"))
@@ -232,6 +244,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Надішли файл XLSX, XLS або CSV.")
         return ConversationHandler.END
 
+    context.user_data.pop("pending_file", None)
     caption = update.message.caption or ""
     match = re.search(r"(\d{2})[./-](\d{2})[./-](\d{4})", caption)
     if not match:
@@ -260,7 +273,9 @@ async def date_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await process_file(update, context, pending[0], pending[1], report_date)
 
 async def process_file(update, context, file_id, filename, report_date):
+    await update.message.reply_text("Файл отримано. Читаю таблицю…")
     try:
+        datetime.strptime(report_date, "%Y-%m-%d")
         tg_file = await context.bot.get_file(file_id)
         bio = io.BytesIO()
         await tg_file.download_to_memory(out=bio)
@@ -297,6 +312,7 @@ def main():
         entry_points=[MessageHandler(filters.Document.ALL, handle_document)],
         states={DATE_WAIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, date_received)]},
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
     )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
