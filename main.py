@@ -1,4 +1,5 @@
 import os
+import json
 import calendar
 import re
 import io
@@ -231,6 +232,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         await update.message.reply_text("Цей бот приватний і доступний лише власнику.")
         return
+    frames = daily_frames()
+    if frames:
+        await update.message.reply_text("Денні звіти:\n" + "\n".join(f"{day} — {len(frame)} магазинів" for day, frame in list(frames.items())[-30:]))
+        return
     conn = db()
     row = conn.execute("SELECT MAX(report_date) FROM snapshots").fetchone()
     conn.close()
@@ -240,6 +245,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def dates_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
+        return
+    frames = daily_frames()
+    if frames:
+        await update.message.reply_text("Денні звіти:\n" + "\n".join(f"{day} — {len(frame)} магазинів" for day, frame in list(frames.items())[-30:]))
         return
     conn = db()
     try:
@@ -254,6 +263,8 @@ async def dates_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
+        return
+    if await daily_command(update, context, "report"):
         return
     conn = db()
     try:
@@ -272,6 +283,8 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def store_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
+        return
+    if await daily_command(update, context, "store"):
         return
     conn = db()
     try:
@@ -375,6 +388,8 @@ def weekly_report(end, store=None):
 async def week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
+    if await daily_command(update, context, "week"):
+        return
     conn = db()
     try:
         latest = conn.execute("SELECT MAX(report_date) FROM snapshots").fetchone()[0]
@@ -407,6 +422,159 @@ async def week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         store = matches[0]
     await update.message.reply_text(weekly_report(end, store))
+
+
+def daily_db():
+    conn = db()
+    conn.execute("CREATE TABLE IF NOT EXISTS daily_reports (report_date TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+    return conn
+
+
+def daily_frames():
+    conn = daily_db()
+    try:
+        return {date: pd.read_json(io.StringIO(payload), orient="records")
+                for date, payload in conn.execute("SELECT report_date, payload FROM daily_reports ORDER BY report_date")}
+    finally:
+        conn.close()
+
+
+def read_daily(raw):
+    sheets = pd.read_excel(io.BytesIO(raw), sheet_name=None)
+    sheets = {name.strip(): frame for name, frame in sheets.items()}
+    if not {"Продажі", "Якісні"}.issubset(sheets):
+        raise ValueError("Потрібні вкладки Продажі та Якісні.")
+    buffer = io.BytesIO()
+    sheets["Продажі"].to_excel(buffer, index=False)
+    sales = read_report(buffer.getvalue(), "sales.xlsx")
+    quality = sheets["Якісні"].copy()
+    quality.columns = quality.columns.str.strip()
+    quality = quality.dropna(subset=["Склад"])
+    quality["store"] = quality["Склад"].astype(str).str.strip()
+    if quality["store"].duplicated().any():
+        raise ValueError("На вкладці Якісні повторюються магазини.")
+    mapping = {"traffic": "Трафік загальний", "receipts": "Кіл-ть Чеків",
+               "pudo": "Трафік PUDO", "ktc": "К-ть Товарів у Чеку", "quality_sales": "Сума, $"}
+    for target, column in mapping.items():
+        values = pd.to_numeric(quality[column].astype(str).str.replace(r"\s+", "", regex=True).str.replace(",", ".", regex=False), errors="coerce")
+        if values.isna().any():
+            raise ValueError(f"Порожні або некоректні числа у колонці {column}.")
+        quality[target] = values
+    if (quality[["traffic", "receipts", "pudo", "ktc"]] < 0).any().any():
+        raise ValueError("Трафік, чеки та КТЧ мають бути невід’ємними.")
+    if (quality.pudo > quality.traffic).any():
+        raise ValueError("Трафік PUDO перевищує загальний трафік.")
+    if set(sales.store) != set(quality.store):
+        raise ValueError("Перелік магазинів на двох вкладках має збігатися.")
+    quality["estimated_items"] = quality.ktc * quality.receipts
+    return sales.merge(quality[["store", *mapping, "estimated_items"]], on="store", validate="one_to_one")
+
+
+def daily_period(frames, start, end, store=None):
+    days = [start + timedelta(days=i) for i in range((end-start).days+1)]
+    missing = [day.isoformat() for day in days if day.isoformat() not in frames]
+    if missing:
+        raise ValueError("Бракує денних звітів: " + ", ".join(missing))
+    selected = [frames[day.isoformat()] for day in days]
+    if store:
+        if any(store not in set(frame.store) for frame in selected):
+            raise ValueError("Магазин відсутній у частині денних звітів.")
+        selected = [frame[frame.store == store] for frame in selected]
+    elif any(set(frame.store) != set(selected[0].store) for frame in selected):
+        raise ValueError("Перелік магазинів у денних звітах відрізняється.")
+    return pd.concat(selected, ignore_index=True)
+
+
+def quality_summary(frame):
+    totals = frame.sum(numeric_only=True)
+    traffic = totals.traffic - totals.pudo
+    return {"Трафік без PUDO": traffic, "Чеки": totals.receipts,
+            "КОП, %": totals.receipts / traffic * 100 if traffic else None,
+            "Середній чек, $": totals.quality_sales / totals.receipts if totals.receipts else None,
+            "КТЧ ≈": totals.estimated_items / totals.receipts if totals.receipts else None}
+
+
+def daily_summary(frames, store=None):
+    latest = max(frames)
+    end = datetime.strptime(latest, "%Y-%m-%d").date()
+    day = daily_period(frames, end, end, store)
+    lines = [f"📊 {store or 'РЕГІОН'} — {latest}", "ЗА ДЕНЬ"]
+    for metric, label in WEEK_METRICS.items():
+        lines.append(f"• {label}: {fmt(day[metric].sum())}")
+    for label, value in quality_summary(day).items():
+        lines.append(f"• {label}: {value:.2f}" if value is not None else f"• {label}: немає бази")
+    try:
+        month = daily_period(frames, end.replace(day=1), end, store)
+        sales = month.sales.sum()
+        plan = day.plan.sum()
+        lines.extend(["", f"Продажі з початку місяця: {fmt(sales)}", f"План місяця: {fmt(plan)}"])
+        if plan > 0:
+            lines.extend([f"Факт виконання: {sales/plan*100:.2f}%", f"Тренд: {sales/end.day*calendar.monthrange(end.year,end.month)[1]/plan*100:.2f}%"])
+    except ValueError as exc:
+        lines.extend(["", "Місячний підсумок і тренд очікують повних даних.", str(exc)])
+    lines.append("КТЧ ≈ — зважено за чеками з округленого КТЧ у файлі. КОП — без PUDO.")
+    return "\n".join(lines)
+
+
+def daily_week(frames, end, store=None):
+    end -= timedelta(days=(end.weekday()+1)%7)
+    current = daily_period(frames, end-timedelta(days=6), end, store)
+    previous = daily_period(frames, end-timedelta(days=13), end-timedelta(days=7), store)
+    lines = [f"📊 {store or 'РЕГІОН'} — календарні тижні",
+             f"{end-timedelta(days=13):%d.%m}–{end-timedelta(days=7):%d.%m} → {end-timedelta(days=6):%d.%m}–{end:%d.%m.%Y}"]
+    for metric,label in WEEK_METRICS.items():
+        old,new = previous[metric].sum(),current[metric].sum()
+        change = f"{(new-old)/old*100:+.2f}%" if old>0 else "немає бази для %"
+        lines.append(f"• {label}: {fmt(old)} → {fmt(new)} ({change})")
+    oldq,newq = quality_summary(previous),quality_summary(current)
+    for label in oldq:
+        old,new=oldq[label],newq[label]
+        lines.append(f"• {label}: {old:.2f} → {new:.2f}" if old is not None and new is not None else f"• {label}: немає бази")
+    lines.append("КТЧ ≈ — зважено за чеками. КОП — без PUDO.")
+    for name in sorted(set(current.store)):
+        before=previous[previous.store==name]; after=current[current.store==name]
+        if after.direct.sum() >= before.direct.sum():
+            continue
+        a,b=quality_summary(before),quality_summary(after)
+        lines.extend(["", f"План дій — {name} (прямі впали)"])
+        if a['КОП, %'] is not None and b['КОП, %'] is not None and b['КОП, %'] < a['КОП, %']:
+            effect=(a['КОП, %']-b['КОП, %'])/100*b['Трафік без PUDO']*(b['Середній чек, $'] or 0)
+            lines.append(f"• Керуючому організувати парні консультації у пікові години. Ціль КОП {a['КОП, %']:.2f}%, перевірка наступної неділі. Орієнтовний ефект за такого самого трафіку й чека: {fmt(effect)}.")
+        elif a['Середній чек, $'] is not None and b['Середній чек, $'] is not None and b['Середній чек, $'] < a['Середній чек, $']:
+            effect=(a['Середній чек, $']-b['Середній чек, $'])*b['Чеки']
+            lines.append(f"• Керуючому впровадити пропозицію комплекту та дорожчої альтернативи. Ціль середнього чека {a['Середній чек, $']:.2f} $, перевірка наступної неділі. Орієнтовний ефект за тієї самої кількості чеків: {fmt(effect)}.")
+        else:
+            lines.append("• Керуючому до середи перевірити причини зміни трафіку та наявність ходових товарів. За результатом обрати дію й ціль, перевірка наступної неділі. Для оцінки ефекту потрібні результати перевірки.")
+    return "\n".join(lines)
+
+
+async def daily_command(update, context, mode):
+    frames=daily_frames()
+    if not frames:
+        return False
+    args=list(context.args) if mode in ('store','week') else []
+    end=datetime.strptime(max(frames), '%Y-%m-%d').date()
+    try:
+        if mode=='week' and args and re.fullmatch(r'\d{2}\.\d{2}\.\d{4}',args[-1]):
+            end=datetime.strptime(args.pop(),'%d.%m.%Y').date()
+        query=norm(' '.join(args)); store=None
+        if query and query!='регіон':
+            names=sorted({name for frame in frames.values() for name in frame.store})
+            matches=[name for name in names if norm(name)==query] or [name for name in names if query in norm(name)]
+            if len(matches)!=1:
+                raise ValueError('Уточни магазин: '+', '.join(matches or names))
+            store=matches[0]
+        if mode=='store' and not query:
+            result='Приклад: /store Материк\n'+'\n'.join(frames[max(frames)].store)
+        elif mode=='week':
+            result=daily_week(frames,end,store)
+        else:
+            result=daily_summary(frames,store)
+    except ValueError as exc:
+        result=str(exc)
+    for offset in range(0,len(result),3500):
+        await update.message.reply_text(result[offset:offset+3500])
+    return True
 
 
 async def setup_commands(app):
@@ -468,7 +636,21 @@ async def process_file(update, context, file_id, filename, report_date):
         tg_file = await context.bot.get_file(file_id)
         bio = io.BytesIO()
         await tg_file.download_to_memory(out=bio)
-        current = read_report(bio.getvalue(), filename)
+        raw = bio.getvalue()
+        if Path(filename).suffix.lower() in (".xlsx", ".xls") and "Якісні" in [name.strip() for name in pd.ExcelFile(io.BytesIO(raw)).sheet_names]:
+            current = read_daily(raw)
+            conn = daily_db()
+            try:
+                with conn:
+                    conn.execute("INSERT OR REPLACE INTO daily_reports VALUES (?, ?)", (report_date, current.to_json(orient="records", force_ascii=False)))
+            finally:
+                conn.close()
+            await update.message.reply_text("Денний звіт збережено. Повторне завантаження за цю дату замінює дані.")
+            result = daily_summary({day: frame for day, frame in daily_frames().items() if day <= report_date})
+            for offset in range(0, len(result), 3500):
+                await update.message.reply_text(result[offset:offset+3500])
+            return ConversationHandler.END
+        current = read_report(raw, filename)
         if current.empty:
             raise ValueError("У файлі не знайшов рядків із магазинами.")
         prev_date = previous_snapshot(report_date)
