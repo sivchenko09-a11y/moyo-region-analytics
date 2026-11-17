@@ -1281,6 +1281,20 @@ def parse_focus_sheets(sheets):
                     if identity in result:
                         raise ValueError(f"Фокуси: повтор {category} за {date}.")
                     result[identity] = (date, category, unit, quantity)
+                    # The adjacent column contains the monetary amount on tabs
+                    # where it is filled. Its header is the month, not "Сума".
+                    amount_raw = values[c+2] if c+2 < len(values) else None
+                    if unit != "$" and amount_raw is not None and str(amount_raw).strip() != "":
+                        try:
+                            amount = float(re.sub(r"\s+", "", str(amount_raw)).replace(",", "."))
+                        except (ValueError, TypeError):
+                            raise ValueError(f"Фокуси: {title}, {date} — некоректна сума.")
+                        if not math.isfinite(amount) or amount < 0:
+                            raise ValueError(f"Фокуси: {title}, {date} — перевір суму.")
+                        amount_identity = (category + " · сума", date)
+                        if amount_identity in result:
+                            raise ValueError(f"Фокуси: повтор суми {category} за {date}.")
+                        result[amount_identity] = (date, category + " · сума", "$", amount)
     missing = set(FOCUS_CONFIG) - found
     if missing:
         raise ValueError("Фокуси: не знайдено вкладки: " + ", ".join(sorted(missing)))
@@ -1380,73 +1394,113 @@ def focus_categories(selected=None):
     return [values[selected]]
 
 
+
+def focus_metrics(category, unit, data, start, end=None):
+    """Show amount when it exists anywhere in the imported history."""
+    metrics = [(category, unit, "Кількість" if unit != "$" else "Сума")]
+    amount_category = category + " · сума"
+    if unit != "$" and any(name == amount_category for name, _ in data):
+        metrics.append((amount_category, "$", "Сума"))
+    return metrics
+
+
+def focus_pair(data, category, unit, start, end):
+    quantity = focus_total(data, category, start, end)
+    if unit == "$":
+        return focus_value(quantity, unit)
+    amount = focus_total(data, category + " · сума", start, end)
+    if amount is None:
+        return focus_value(quantity, unit)
+    return f"{focus_value(quantity, unit)} / {focus_value(amount, '$')}"
+
+
+def focus_pair_change(data, category, unit, old_start, old_end, new_start, new_end):
+    old = focus_total(data, category, old_start, old_end)
+    new = focus_total(data, category, new_start, new_end)
+    if old is None or new is None:
+        return "⚪ Немає повних даних для порівняння"
+    delta = new - old
+    icon = "🟢" if delta > 0 else "🔴" if delta < 0 else "⚪"
+    pct = f"{delta / old * 100:+.2f}%" if old > 0 else "немає бази для %"
+    sign = "+" if delta > 0 else "−" if delta < 0 else ""
+    result = (f"{icon} {focus_pair(data, category, unit, old_start, old_end)} → "
+              f"{focus_pair(data, category, unit, new_start, new_end)}; "
+              f"{sign}{focus_value(abs(delta), unit)} ({pct})")
+    if unit != "$":
+        amount_category = category + " · сума"
+        old_amount = focus_total(data, amount_category, old_start, old_end)
+        new_amount = focus_total(data, amount_category, new_start, new_end)
+        if old_amount is not None and new_amount is not None:
+            amount_delta = new_amount - old_amount
+            amount_pct = f"{amount_delta / old_amount * 100:+.2f}%" if old_amount > 0 else "немає бази для %"
+            amount_sign = "+" if amount_delta > 0 else "−" if amount_delta < 0 else ""
+            result += f" / {amount_sign}{fmt(abs(amount_delta))} ({amount_pct})"
+    return result
+
+
 def focus_date_report(data, day, selected=None):
     previous_month = day.replace(day=1) - timedelta(days=1)
-    lines = [f"🎯 Фокуси + категорії — РЕГІОН, {day:%d.%m.%Y}",
-             "ЗА ОБРАНУ ДАТУ — порівняння аналогічних календарних дат."]
+    lines = [f"🎯 Фокуси + категорії — РЕГІОН, {day:%d.%m.%Y}"]
     for category, unit, _ in focus_categories(selected):
-        daily = data.get((category, day.isoformat()))
-        current = daily[1] if daily is not None else None
-        lines.extend(["", category, f"Факт {day:%d.%m.%Y}: {focus_value(current, unit)}"])
+        lines.extend(["", category, f"Факт: {focus_pair(data, category, unit, day, day)}"])
         for label, year, month in (("місяць до місяця", previous_month.year, previous_month.month),
                                    ("Рік до Року", day.year - 1, day.month)):
-            comparison = focus_comparison_date(day, year, month)
-            if comparison is None:
-                lines.append(f"{label}: аналогічної календарної дати немає")
-                continue
-            old_row = data.get((category, comparison.isoformat()))
-            old = old_row[1] if old_row is not None else None
-            lines.append(f"{label} ({comparison:%d.%m.%Y} → {day:%d.%m.%Y}): " + focus_change(old, current, unit))
+            old = focus_comparison_date(day, year, month)
+            lines.append(f"{label}: " + (focus_pair_change(data, category, unit, old, old, day, day)
+                                        if old else "немає аналогічної календарної дати"))
     return "\n".join(lines)
 
 
 def focus_mtd_report(data, day, selected=None):
-    """Month-to-date through the latest known date, compared over equal day counts."""
     previous_month = day.replace(day=1) - timedelta(days=1)
+    start = day.replace(day=1)
     lines = ["🎯 Фокуси + категорії — РЕГІОН · Поточний місяць",
-             f"Поточний період: {day.replace(day=1):%d.%m.%Y}–{day:%d.%m.%Y}",
-             "Порівняння накопичувальних показників за однакові календарні дні."]
+             f"Поточний період: {start:%d.%m.%Y}–{day:%d.%m.%Y}"]
     for category, unit, _ in focus_categories(selected):
-        current = focus_total(data, category, day.replace(day=1), day)
-        lines.extend(["", category, f"Факт за поточний місяць: {focus_value(current, unit)}"])
+        lines.extend(["", "", category, f"Факт: {focus_pair(data, category, unit, start, day)}"])
         for label, year, month in (("місяць до місяця", previous_month.year, previous_month.month),
                                    ("Рік до Року", day.year - 1, day.month)):
             if day.day > calendar.monthrange(year, month)[1]:
-                lines.append(f"{label}: немає рівного календарного періоду в {month:02d}.{year}")
+                lines.append(f"{label}: немає рівного календарного періоду")
                 continue
-            end = day.replace(year=year, month=month)
-            old = focus_total(data, category, end.replace(day=1), end)
-            lines.append(f"{label} (01.{month:02d}–{end:%d.%m.%Y} → 01.{day.month:02d}–{day:%d.%m.%Y}): " + focus_change(old, current, unit))
+            old_end = day.replace(year=year, month=month)
+            lines.append(f"{label}: " + focus_pair_change(
+                data, category, unit, old_end.replace(day=1), old_end, start, day))
     return "\n".join(lines)
 
 
 def focus_week_report(data, monday, selected=None):
     latest = datetime.strptime(max(day for _, day in data), "%Y-%m-%d").date()
-    end = min(monday+timedelta(days=6), latest)
+    end = min(monday + timedelta(days=6), latest)
     if end < monday:
         return "За цей тиждень немає даних."
-    previous_start, previous_end = monday-timedelta(days=7), end-timedelta(days=7)
+    previous_start, previous_end = monday - timedelta(days=7), end - timedelta(days=7)
     lines = ["🎯 Фокуси + категорії — РЕГІОН", week_title(monday),
              f"Порівняння: {previous_start:%d.%m.%Y}–{previous_end:%d.%m.%Y} → {monday:%d.%m.%Y}–{end:%d.%m.%Y}"]
-    if (end-monday).days < 6:
+    if (end - monday).days < 6:
         lines.append("Неповний тиждень: порівнюються однакові дні тижня.")
     for category, unit, _ in focus_categories(selected):
-        old = focus_total(data, category, previous_start, previous_end)
-        new = focus_total(data, category, monday, end)
-        lines.extend(["", f"{category}: факт {focus_value(new,unit)}", focus_change(old,new,unit)])
+        lines.extend(["", category, f"Факт: {focus_pair(data, category, unit, monday, end)}",
+                      "тиждень до тижня: " + focus_pair_change(
+                          data, category, unit, previous_start, previous_end, monday, end)])
     return "\n".join(lines)
 
 
 async def focus_send(message, report):
-    # Split on lines so one category comparison is not cut in half.
-    chunk = ""
+    # Telegram HTML: bold percentage changes only, not the rest of the comparison.
+    import html
+    chunks, chunk = [], ""
     for line in report.splitlines():
-        if len(chunk)+len(line)+1 > 3500:
-            await message.reply_text(chunk)
+        escaped = html.escape(line)
+        escaped = re.sub(r"(?<![\w])([+−-]?\d+(?:[.,]\d+)?%)", r"<b>\1</b>", escaped)
+        if len(chunk) + len(escaped) + 1 > 3500 and chunk:
+            chunks.append(chunk)
             chunk = ""
-        chunk += line + "\n"
+        chunk += escaped + "\n"
     if chunk:
-        await message.reply_text(chunk)
+        chunks.append(chunk)
+    for part in chunks:
+        await message.reply_text(part, parse_mode="HTML")
 
 
 async def focus_cmd(update, context):
