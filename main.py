@@ -1,4 +1,5 @@
 import os
+import asyncio
 import json
 from types import SimpleNamespace
 import calendar
@@ -440,10 +441,33 @@ def daily_db():
 def daily_frames():
     conn = daily_db()
     try:
-        return {date: pd.read_json(io.StringIO(payload), orient="records")
-                for date, payload in conn.execute("SELECT report_date, payload FROM daily_reports ORDER BY report_date")}
+        stored = {day: pd.read_json(io.StringIO(payload), orient="records")
+                  for day, payload in conn.execute("SELECT report_date, payload FROM daily_reports ORDER BY report_date")}
     finally:
         conn.close()
+    return derive_daily_sales(stored)
+
+
+def derive_daily_sales(stored):
+    # Stored sales are month-to-date snapshots; quality values are daily.
+    result = {}
+    metrics = list(WEEK_METRICS) + ["py"]
+    for day, source in stored.items():
+        frame = source.copy()
+        for metric in metrics:
+            frame["cumulative_" + metric] = frame[metric]
+        report_day = datetime.strptime(day, "%Y-%m-%d").date()
+        if report_day.day > 1:
+            previous_date = (report_day - timedelta(days=1)).isoformat()
+            previous = stored.get(previous_date)
+            if previous is None:
+                frame[metrics] = float("nan")
+            else:
+                baseline = previous.set_index("store")
+                for metric in metrics:
+                    frame[metric] = source[metric] - source.store.map(baseline[metric])
+        result[day] = frame
+    return result
 
 
 def read_daily(raw):
@@ -489,6 +513,8 @@ def daily_period(frames, start, end, store=None):
         selected = [frame[frame.store == store] for frame in selected]
     elif any(set(frame.store) != set(selected[0].store) for frame in selected):
         raise ValueError("Перелік магазинів у денних звітах відрізняється.")
+    if any(frame[list(WEEK_METRICS)].isna().any().any() for frame in selected):
+        raise ValueError("Для денних продажів бракує звіту за попередню дату або магазину в ньому. Завантаж також дату перед початком періоду.")
     return pd.concat(selected, ignore_index=True)
 
 
@@ -504,21 +530,24 @@ def quality_summary(frame):
 def daily_summary(frames, store=None):
     latest = max(frames)
     end = datetime.strptime(latest, "%Y-%m-%d").date()
-    day = daily_period(frames, end, end, store)
+    day = frames[latest]
+    if store:
+        day = day[day.store == store]
+    if day.empty:
+        raise ValueError("Магазин відсутній в останньому звіті.")
     lines = [f"📊 {store or 'РЕГІОН'} — {latest}", "ЗА ДЕНЬ"]
     for metric, label in WEEK_METRICS.items():
-        lines.append(f"• {label}: {fmt(day[metric].sum())}")
+        if day[metric].isna().any():
+            lines.append(f"• {label}: потрібен звіт за {end-timedelta(days=1):%d.%m.%Y}")
+        else:
+            lines.append(f"• {label}: {fmt(day[metric].sum())}")
     for label, value in quality_summary(day).items():
         lines.append(f"• {label}: {value:.2f}" if value is not None else f"• {label}: немає бази")
-    try:
-        month = daily_period(frames, end.replace(day=1), end, store)
-        sales = month.sales.sum()
-        plan = day.plan.sum()
-        lines.extend(["", f"Продажі з початку місяця: {fmt(sales)}", f"План місяця: {fmt(plan)}"])
-        if plan > 0:
-            lines.extend([f"Факт виконання: {sales/plan*100:.2f}%", f"Тренд: {sales/end.day*calendar.monthrange(end.year,end.month)[1]/plan*100:.2f}%"])
-    except ValueError as exc:
-        lines.extend(["", "Місячний підсумок і тренд очікують повних даних.", str(exc)])
+    sales = day.cumulative_sales.sum()
+    plan = day.plan.sum()
+    lines.extend(["", f"Продажі з початку місяця: {fmt(sales)}", f"План місяця: {fmt(plan)}"])
+    if plan > 0:
+        lines.extend([f"Факт виконання: {sales/plan*100:.2f}%", f"Тренд: {sales/end.day*calendar.monthrange(end.year,end.month)[1]/plan*100:.2f}%"])
     return "\n".join(lines)
 
 
@@ -619,8 +648,203 @@ async def store_selected(update, context):
         await store_cmd(selected_update, context)
 
 
+async def day_menu(message, page=0):
+    frames = daily_frames()
+    dates = sorted(frames, reverse=True)
+    if not dates:
+        await message.reply_text("Спочатку завантаж Excel із вкладками Продажі та Якісні.")
+        return
+    page = min(max(page, 0), (len(dates)-1)//20)
+    buttons = [[InlineKeyboardButton(datetime.strptime(day, "%Y-%m-%d").strftime("%d.%m.%Y"),
+                                     callback_data=f"daydate:{day}")]
+               for day in dates[page*20:(page+1)*20]]
+    navigation = []
+    if page:
+        navigation.append(InlineKeyboardButton("Новіші дати", callback_data=f"daypage:{page-1}"))
+    if (page+1)*20 < len(dates):
+        navigation.append(InlineKeyboardButton("Старіші дати", callback_data=f"daypage:{page+1}"))
+    if navigation:
+        buttons.append(navigation)
+    await message.reply_text("Обери дату звіту:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def day_stores(message, day, context):
+    frames = daily_frames()
+    if day not in frames:
+        await message.reply_text("За цю дату звіту немає. Вибери іншу дату через /day.")
+        return
+    names = sorted(frames[day].store.tolist())
+    # Each menu keeps its own mapping, so older buttons remain unambiguous.
+    import uuid
+    menu_id = uuid.uuid4().hex[:12]
+    menus = context.user_data.setdefault("day_menus", {})
+    menus[menu_id] = (day, names)
+    if len(menus) > 50:
+        del menus[next(iter(menus))]
+    buttons = [[InlineKeyboardButton("Увесь регіон", callback_data=f"daypick:{menu_id}:-1")]]
+    buttons.extend([InlineKeyboardButton(name, callback_data=f"daypick:{menu_id}:{index}")]
+                   for index, name in enumerate(names))
+    await message.reply_text(f"{day} — обери магазин або регіон:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def day_cmd(update, context):
+    if not is_owner(update):
+        return
+    if not context.args:
+        await day_menu(update.message)
+        return
+    try:
+        day = datetime.strptime(context.args[0], "%d.%m.%Y").date().isoformat()
+    except ValueError:
+        await update.message.reply_text("Приклад: /day 03.11.2026. Або натисни /day для вибору дати.")
+        return
+    await day_stores(update.message, day, context)
+
+
+async def day_selected(update, context):
+    query = update.callback_query
+    if not is_owner(update):
+        await query.answer("Доступ лише власнику.", show_alert=True)
+        return
+    await query.answer()
+    action, value = query.data.split(":", 1)
+    if action == "daypage":
+        await day_menu(query.message, int(value))
+    elif action == "daydate":
+        await day_stores(query.message, value, context)
+    else:
+        menu_id, index = value.split(":")
+        menu = context.user_data.get("day_menus", {}).get(menu_id)
+        if menu is None:
+            await query.message.reply_text("Відкрий вибір дати знову через /day.")
+            return
+        day, names = menu
+        index = int(index)
+        if index < -1 or index >= len(names):
+            await query.message.reply_text("Відкрий вибір дати знову через /day.")
+            return
+        frames = daily_frames()
+        if day not in frames:
+            await query.message.reply_text("За цю дату звіту немає.")
+            return
+        try:
+            report = daily_summary({date: frame for date, frame in frames.items() if date <= day},
+                                   names[index] if index >= 0 else None)
+        except ValueError as exc:
+            report = str(exc)
+        for offset in range(0, len(report), 3500):
+            await query.message.reply_text(report[offset:offset+3500])
+
+
+SALES_SHEET_ID = "1JmXrIBABlzrUFG5IsOgjTD_rG7zbAzvdLBnB4FDlqnE"
+QUALITY_SHEET_ID = "18snM8aRqhGmnws4Fx7UbyXzAKexpVzl5p60nEAKJaNQ"
+
+
+def sheet_dates(metadata):
+    dates = {}
+    for sheet in metadata.get("sheets", []):
+        title = sheet["properties"]["title"]
+        try:
+            day = datetime.strptime(title.strip(), "%d.%m.%Y").date().isoformat()
+        except ValueError:
+            continue
+        if day in dates:
+            raise ValueError(f"Дві вкладки позначають одну дату {day}. Залиш одну вкладку на дату.")
+        dates[day] = title
+    return dates
+
+
+def google_table(session, sheet_id, title):
+    from urllib.parse import quote
+    escaped = "'" + title.replace("'", "''") + "'"
+    response = session.get(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{quote(escaped, safe='')}",
+        params={"valueRenderOption": "UNFORMATTED_VALUE"}, timeout=45)
+    response.raise_for_status()
+    rows = response.json().get("values", [])
+    for index, row in enumerate(rows):
+        if "Склад" in [str(value).strip() for value in row]:
+            header = [str(value).strip() for value in row]
+            body = rows[index+1:]
+            if any(len(values) > len(header) for values in body):
+                raise ValueError(f"Зайві колонки у вкладці {title}.")
+            return pd.DataFrame([values + [None]*(len(header)-len(values)) for values in body], columns=header)
+    raise ValueError(f"У вкладці {title} не знайдено заголовок Склад.")
+
+
+def sync_google_sheets():
+    from google.oauth2.service_account import Credentials
+    from google.auth.transport.requests import AuthorizedSession
+    config = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not config:
+        raise ValueError("Додай GOOGLE_SERVICE_ACCOUNT_JSON у змінні Railway та надай службовому акаунту доступ до обох таблиць.")
+    credentials = Credentials.from_service_account_info(json.loads(config), scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+    with AuthorizedSession(credentials) as session:
+        calendars = []
+        for sheet_id in (SALES_SHEET_ID, QUALITY_SHEET_ID):
+            response = session.get(f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}",
+                                   params={"fields": "sheets.properties.title"}, timeout=45)
+            response.raise_for_status()
+            calendars.append(sheet_dates(response.json()))
+        sales_dates, quality_dates = calendars
+        common = sorted(set(sales_dates) & set(quality_dates))
+        if not common:
+            raise ValueError("Немає спільних дат. Назви вкладки в обох таблицях однаково, наприклад 01.11.2026.")
+        prepared = []
+        for day in common:
+            sales = google_table(session, SALES_SHEET_ID, sales_dates[day])
+            quality = google_table(session, QUALITY_SHEET_ID, quality_dates[day])
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                sales.to_excel(writer, sheet_name="Продажі", index=False)
+                quality.to_excel(writer, sheet_name="Якісні", index=False)
+            try:
+                frame = read_daily(buffer.getvalue())
+                if frame.empty:
+                    raise ValueError("Таблиця порожня.")
+            except (ValueError, KeyError) as exc:
+                raise ValueError(f"Перевір вкладки за {day}: {exc}") from exc
+            prepared.append((day, frame.to_json(orient="records", force_ascii=False)))
+    conn = daily_db()
+    try:
+        with conn:
+            conn.executemany("INSERT OR REPLACE INTO daily_reports VALUES (?, ?)", prepared)
+    finally:
+        conn.close()
+    unpaired = sorted(set(sales_dates) ^ set(quality_dates))
+    result = f"Оновлено {len(prepared)} дат. Остання дата — {common[-1]}. Перегляд — /day або /report."
+    if unpaired:
+        result += "\nПропущені дати без пари вкладок: " + ", ".join(unpaired)
+    return result
+
+
+async def sync_cmd(update, context):
+    if not is_owner(update):
+        return
+    if context.bot_data.get("sync_running"):
+        await update.message.reply_text("Оновлення вже виконується.")
+        return
+    context.bot_data["sync_running"] = True
+    try:
+        await update.message.reply_text("Читаю таблиці Google…")
+        result = await asyncio.to_thread(sync_google_sheets)
+    except ImportError:
+        result = "Додай google-auth[requests]>=2,<3 до requirements.txt та онови Railway."
+    except ValueError as exc:
+        result = str(exc)
+    except Exception as exc:
+        log.error("Google Sheets sync failed: %s", type(exc).__name__)
+        result = "Оновлення не вдалося. Перевір доступ службового акаунта до обох таблиць, увімкнення Google Sheets API та з’єднання. Спробуй /sync знову."
+    finally:
+        context.bot_data["sync_running"] = False
+    for offset in range(0, len(result), 3500):
+        await update.message.reply_text(result[offset:offset+3500])
+
+
 async def setup_commands(app):
     await app.bot.set_my_commands([
+        BotCommand("sync", "Оновити дані з Google Таблиць"),
+        BotCommand("day", "Обрати дату та магазин або регіон"),
         BotCommand("week", "Порівняння календарних тижнів Пн–Нд"),
         BotCommand("store", "Показники конкретного магазину"),
         BotCommand("report", "Останній звіт і тренд регіону"),
@@ -687,7 +911,7 @@ async def process_file(update, context, file_id, filename, report_date):
                     conn.execute("INSERT OR REPLACE INTO daily_reports VALUES (?, ?)", (report_date, current.to_json(orient="records", force_ascii=False)))
             finally:
                 conn.close()
-            await update.message.reply_text("Денний звіт збережено. Повторне завантаження за цю дату замінює дані.")
+            await update.message.reply_text("Звіт збережено: продажі накопичувально, якісні за день. Повторне завантаження за цю дату замінює дані.")
             result = daily_summary({day: frame for day, frame in daily_frames().items() if day <= report_date})
             for offset in range(0, len(result), 3500):
                 await update.message.reply_text(result[offset:offset+3500])
@@ -730,6 +954,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("sync", sync_cmd, block=False))
+    app.add_handler(CommandHandler("day", day_cmd))
+    app.add_handler(CallbackQueryHandler(day_selected, pattern=r"^day(page|date|pick):"))
     app.add_handler(CommandHandler("week", week_cmd))
     app.add_handler(CommandHandler("store", store_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
