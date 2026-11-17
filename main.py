@@ -1296,7 +1296,7 @@ def parse_focus_sheets(sheets):
                         amount_identity = (category + " · сума", date)
                         if amount_identity in result:
                             raise ValueError(f"Фокуси: повтор суми {category} за {date}.")
-                        result[amount_identity] = (date, category + " · сума", "$", amount)
+                        result[amount_identity] = (date, category + " · сума", "грн", amount)
     missing = set(FOCUS_CONFIG) - found
     if missing:
         raise ValueError("Фокуси: не знайдено вкладки: " + ", ".join(sorted(missing)))
@@ -1360,7 +1360,7 @@ def focus_data():
 def focus_value(value, unit):
     if value is None:
         return "немає даних"
-    return fmt(value) if unit == "$" else f"{value:,.0f} шт.".replace(",", " ")
+    return fmt(value) if unit == "$" else (f"{value:,.0f} грн".replace(",", " ") if unit == "грн" else f"{value:,.0f} шт.".replace(",", " "))
 
 
 def focus_total(data, category, start, end):
@@ -1402,8 +1402,15 @@ def focus_metrics(category, unit, data, start, end=None):
     metrics = [(category, unit, "Кількість" if unit != "$" else "Сума")]
     amount_category = category + " · сума"
     if unit != "$" and any(name == amount_category for name, _ in data):
-        metrics.append((amount_category, "$", "Сума"))
+        metrics.append((amount_category, "грн", "Сума"))
     return metrics
+
+
+def focus_amount_value(value):
+    """Amounts adjacent to quantity are in UAH, not USD."""
+    if value is None:
+        return "немає даних"
+    return f"{value:,.0f} грн".replace(",", " ")
 
 
 def focus_pair(data, category, unit, start, end):
@@ -1413,7 +1420,7 @@ def focus_pair(data, category, unit, start, end):
     amount = focus_total(data, category + " · сума", start, end)
     if amount is None:
         return focus_value(quantity, unit)
-    return f"{focus_value(quantity, unit)} / {focus_value(amount, '$')}"
+    return f"{focus_value(quantity, unit)} / {focus_amount_value(amount)}"
 
 
 def focus_pair_change(data, category, unit, old_start, old_end, new_start, new_end):
@@ -1434,9 +1441,13 @@ def focus_pair_change(data, category, unit, old_start, old_end, new_start, new_e
         new_amount = focus_total(data, amount_category, new_start, new_end)
         if old_amount is not None and new_amount is not None:
             amount_delta = new_amount - old_amount
+            # Yellow indicates opposing trends in units and revenue.
+            # Do not flag a zero change as an opposing trend.
+            if delta * amount_delta < 0:
+                result = "🟡" + result[len(icon):]
             amount_pct = f"{amount_delta / old_amount * 100:+.2f}%" if old_amount > 0 else "немає бази для %"
             amount_sign = "+" if amount_delta > 0 else "−" if amount_delta < 0 else ""
-            result += f" / {amount_sign}{fmt(abs(amount_delta))} ({amount_pct})"
+            result += f" / {amount_sign}{focus_amount_value(abs(amount_delta))} ({amount_pct})"
     return result
 
 
