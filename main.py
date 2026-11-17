@@ -1820,6 +1820,131 @@ def group_report_text(day):
         lines.extend(["", category, f"Факт: {focus_pair(data, category, unit, day, day)}"])
     return "\n".join(lines)
 
+
+def digest_dashboard(day):
+    """Render a Telegram-friendly PNG using actual stored sales, plans and focus data."""
+    from PIL import Image, ImageDraw, ImageFont
+    frames = daily_frames()
+    key = day.isoformat()
+    if key not in frames:
+        raise ValueError(f"Немає продажів за {day:%d.%m.%Y}.")
+    frame = frames[key]
+    metrics = [('sales','Оборот'), ('accessories','Аксесуари'), ('services','Послуги')]
+    if frame.empty or frame[[m for m,_ in metrics]+['direct','pickup']].isna().any().any():
+        raise ValueError('Неповні продажі за звітний день')
+    plans = load_monthly_plans(day.strftime('%Y-%m'))
+    days = calendar.monthrange(day.year, day.month)[1]
+    aliases = {'Київ-Олімпійський':'Олімпійський','Київ-Аркадія':'Аркадія',
+               'Київ-Нью Вей':'Нью Вей','Київ-Хрещатик 21':'Хрещатик 21',
+               'Київ-Аладдін':'Аладін','Київ-Комод':'Комод',
+               'Буча-Рітейл Парк':'Буча','Київ-Квадрат':'Квадрат',
+               'Київ-Материк':'Материк','Київ-Ретровіль':'Ретровіль',
+               'Київ-Дрімтаун_new':'Дрім Таун','Київ-Лавіна Молл':'Лавіна',
+               'Київ-Республіка Парк':'Республіка Парк','Київ-Блокбастер':'Блокбастер'}
+    def target(store, metric, source=None):
+        value = plans.loc[store,metric] if store in plans.index and metric in plans.columns else None
+        if (value is None or pd.isna(value)) and metric=='sales' and source is not None:
+            value = source.get('plan')
+        return float(value) if value is not None and pd.notna(value) else None
+    def percentage(actual, goal):
+        return actual/goal*100 if goal is not None and goal>0 and pd.notna(actual) else None
+    region=[]
+    for metric,label in metrics:
+        goals=[target(row.store,metric,row) for _,row in frame.iterrows()]
+        region.append((label,percentage(frame[metric].sum(),sum(goals)/days) if all(g is not None for g in goals) else None))
+    ranking=[]
+    for _,row in frame.iterrows():
+        vals=[percentage(float(row[m]), (target(row.store,m,row) or 0)/days) for m,_ in metrics]
+        ranking.append((str(row.store),vals))
+    ranking.sort(key=lambda r: r[1][0] if r[1][0] is not None else -1,reverse=True)
+    latest_keys=[k for k in frames if k[:7]==day.strftime('%Y-%m') and k<=key]
+    latest=max(latest_keys) if latest_keys else key
+    trend_day=datetime.strptime(latest,'%Y-%m-%d').date()
+    trend_frame=frames[latest]
+    trends=[]
+    for metric,label in metrics:
+        col='cumulative_'+metric
+        actuals=trend_frame[col] if col in trend_frame else None
+        goals=[target(row.store,metric,row) for _,row in trend_frame.iterrows()]
+        if actuals is None or actuals.isna().any() or not all(g is not None for g in goals):
+            trends.append((label,None,None,None))
+            continue
+        actual=float(actuals.sum()); goal=sum(goals)
+        forecast=actual/trend_day.day*calendar.monthrange(trend_day.year,trend_day.month)[1]
+        trends.append((label,percentage(forecast,goal),actual,forecast))
+    focus=focus_data()
+    if not any(k[1]==key for k in focus):
+        raise ValueError('Немає фокусів за звітний день')
+    W=1120; row_h=47; H=1050+len(ranking)*row_h
+    im=Image.new('RGB',(W,H),'#eaf2fb'); d=ImageDraw.Draw(im)
+    font_path='/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+    bold_path='/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
+    def f(size,bold=False): return ImageFont.truetype(bold_path if bold else font_path,size)
+    def rect(x0,y0,x1,y1,fill,r=18): d.rounded_rectangle((x0,y0,x1,y1),radius=r,fill=fill)
+    def txt(x,y,t,size=22,color='#172d4a',bold=False): d.text((x,y),str(t),font=f(size,bold),fill=color)
+    def money(v): return '$'+format(round(v),',').replace(',',' ')
+    def bar(x,y,width,val):
+        rect(x,y,x+width,y+13,'#e0e9f1',6)
+        if val is not None:
+            color='#1bbf66' if val>=100 else '#ef535a' if val<90 else '#f0b52e'
+            if val>0: rect(x,y,x+max(5,int(width*min(val,100)/100)),y+13,color,6)
+    def pct(v): return 'н/д' if v is None else f'{v:.1f}%'
+    rect(18,15,W-18,93,'#11375d',19)
+    txt(45,34,'MOYO  |  РЕГІОН — ПІДСУМКИ ЗА ВЧОРА',29,'white',True)
+    txt(875,42,day.strftime('%d.%m.%Y'),24,'white',True)
+    rect(18,110,535,445,'white'); rect(550,110,1102,445,'white')
+    txt(38,128,'ФІНАНСОВІ ПОКАЗНИКИ',24,bold=True)
+    for i,(metric,label) in enumerate([('sales','Оборот'),('direct','Прямі продажі'),('pickup','Пікап'),('accessories','Аксесуари'),('services','Послуги')]):
+        y=175+i*51
+        rect(37,y,515,y+43,'#eef4fa',9)
+        txt(55,y+8,label,21)
+        amount=money(frame[metric].sum())
+        bbox=d.textbbox((0,0),amount,font=f(22,True))
+        txt(499-(bbox[2]-bbox[0]),y+7,amount,22,bold=True)
+    txt(570,128,'ВИКОНАННЯ ДЕННОГО ПЛАНУ',23,bold=True)
+    for i,(label,val) in enumerate(region):
+        cx=645+i*176; cy=272
+        color='#18b965' if val is not None and val>=100 else '#f0b52e' if val is not None and val>=90 else '#ef535a'
+        d.ellipse((cx-64,cy-64,cx+64,cy+64),outline='#e2eaf5',width=15)
+        if val is not None:
+            d.arc((cx-64,cy-64,cx+64,cy+64),-90,-90+max(1,min(val,100)/100*359),fill=color,width=15)
+        value=pct(val); bbox=d.textbbox((0,0),value,font=f(25,True))
+        txt(cx-(bbox[2]-bbox[0])/2,cy-15,value,25,bold=True)
+        bbox=d.textbbox((0,0),label,font=f(19,True))
+        txt(cx-(bbox[2]-bbox[0])/2,cy+83,label,19,bold=True)
+    table_top=462; table_end=table_top+96+len(ranking)*row_h
+    rect(18,table_top,1102,table_end,'white')
+    txt(40,table_top+14,'МАГАЗИНИ — ВИКОНАННЯ ПЛАНУ (%)',26,bold=True)
+    head=table_top+58; rect(38,head,1082,head+42,'#203f6a',8)
+    for x,t in [(55,'Магазин'),(395,'Оборот'),(620,'Аксесуари'),(867,'Послуги')]: txt(x,head+8,t,19,'white',True)
+    for i,(store,vals) in enumerate(ranking):
+        y=head+48+i*row_h
+        if i%2==0: rect(39,y,1081,y+43,'#f0f5fb',6)
+        txt(54,y+10,aliases.get(store,store.removeprefix('Київ-'))[:23],19,bold=True)
+        for j,(x,v) in enumerate(zip((395,620,867),vals)):
+            col='#11834a' if v is not None and v>=100 else '#d4424b' if v is not None and v<90 else '#bb8500'
+            txt(x,y+9,pct(v),19,col,True)
+            bar(x+105,y+16,100,v)
+    y=table_end+16
+    rect(18,y,1102,y+238,'white')
+    txt(39,y+14,f'ТРЕНД РЕГІОНУ | 01.{trend_day:%m.%Y}–{trend_day:%d.%m.%Y}',25,bold=True)
+    for i,(label,value,actual,forecast) in enumerate(trends):
+        yy=y+59+i*53
+        txt(42,yy,label,20,bold=True)
+        txt(235,yy,pct(value),24,'#11834a' if value is not None and value>=100 else '#d4424b',True)
+        bar(375,yy+11,200,value)
+        txt(600,yy,'Факт: '+money(actual) if actual is not None else 'Немає даних',17)
+        txt(835,yy,'Прогноз: '+money(forecast) if forecast is not None else '—',17)
+    y+=254
+    rect(18,y,1102,y+145,'white')
+    txt(40,y+13,'ФОКУСИ ЗА ВЧОРА',25,bold=True)
+    for i,category in enumerate(('ЕЗ','Клімат')):
+        unit=FOCUS_CONFIG[category][1]
+        txt(55,y+59+i*39,category+':  '+focus_pair(focus,category,unit,day,day),22,bold=True)
+    buf=io.BytesIO(); im.crop((0,0,W,y+165)).save(buf,format='PNG',optimize=True)
+    buf.seek(0); buf.name='moyo_digest.png'
+    return buf
+
 def digest_db():
     conn = db()
     conn.execute("CREATE TABLE IF NOT EXISTS group_digest_sent (report_date TEXT PRIMARY KEY, chat_id TEXT NOT NULL)")
@@ -1833,33 +1958,9 @@ async def send_digest(bot, chat_id, day, force=False):
         conn.close()
     if already and not force:
         return False
-    report = group_report_text(day)
-    # Split before HTML escaping, preserving Telegram's 4096-character limit.
-    lines, chunk = report.splitlines(), ""
-    chunks = []
-    for line in lines:
-        if len(chunk) + len(line) + 1 > 2800 and chunk:
-            chunks.append(chunk)
-            chunk = ""
-        chunk += line + "\n"
-    if chunk:
-        chunks.append(chunk)
-    import html
-    for part in chunks:
-        rendered = []
-        in_table = False
-        for line in part.splitlines():
-            if line == "[[TABLE]]":
-                rendered.append("<pre>")
-                in_table = True
-            elif line == "[[/TABLE]]":
-                rendered.append("</pre>")
-                in_table = False
-            elif in_table:
-                rendered.append(html.escape(line))
-            else:
-                rendered.append(bold_report_percentages(line))
-        await bot.send_message(chat_id=int(chat_id), text="\n".join(rendered), parse_mode="HTML")
+    picture = await asyncio.to_thread(digest_dashboard, day)
+    await bot.send_document(chat_id=int(chat_id), document=picture,
+                            caption=f"📊 МОЙО — звіт за {day:%d.%m.%Y} | тренд регіону")
     conn = digest_db()
     try:
         with conn:
