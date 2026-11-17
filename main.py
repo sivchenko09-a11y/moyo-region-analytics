@@ -2430,25 +2430,25 @@ def interim_dashboard(report_day, slot, rate, data):
     for i,(store,vals,plan) in enumerate(results):
         y=690+i*rowh
         if i%2==0: rect(30,y,1670,y+rowh-2,'#eef5fd',5)
-        txt(43,y+15,short.get(store,store),18,navy,True)
+        txt(43,y+13,short.get(store,store),21,navy,True)
         for k,xp,xf,xe,xs in (('sales',295,399,573,None),('accessories',695,807,939,1075),('services',1198,1310,1441,1576)):
             pp=perf(vals[k],plan[k]); share=100*vals[k]/vals['sales'] if vals['sales'] else 0
-            txt(xp,y+16,money(plan[k]) if plan[k] is not None else '—',17,navy)
-            txt(xf,y+16,money(vals[k]),18,navy,True)
+            txt(xp,y+14,money(plan[k]) if plan[k] is not None else '—',19,navy,True)
+            txt(xf,y+14,money(vals[k]),20,navy,True)
             if pp is not None:
                 badge_x=xe-13
                 rect(badge_x,y+8,badge_x+90,y+44,
                      '#dff7e9' if pp>=100 else '#fff1ce' if pp>=70 else '#ffe3e8',9)
-                txt(badge_x+45,y+13,pct(pp),17,color(pp),True,'ma')
-            if xs is not None: txt(xs,y+16,f'{share:.1f}%',17,muted,True)
+                txt(badge_x+45,y+11,pct(pp),20,color(pp),True,'ma')
+            if xs is not None: txt(xs,y+14,f'{share:.1f}%',19,navy,True)
     yy=690+14*rowh+5
     rect(30,yy,1670,yy+53,navy,8)
     txt(43,yy+13,'РАЗОМ',20,'white',True)
     for k,xp,xf,xe,xs in (('sales',295,399,573,None),('accessories',695,807,939,1075),('services',1198,1310,1441,1576)):
-        txt(xp,yy+15,money(targets[k]) if targets[k] is not None else '—',17,'white')
-        txt(xf,yy+15,money(totals[k]),18,'white',True)
-        txt(xe,yy+15,pct(perf(totals[k],targets[k])),18,'#b9f2d6',True)
-        if xs is not None: txt(xs,yy+15,f'{100*totals[k]/totals["sales"] if totals["sales"] else 0:.1f}%',17,'white')
+        txt(xp,yy+13,money(targets[k]) if targets[k] is not None else '—',19,'white',True)
+        txt(xf,yy+13,money(totals[k]),20,'white',True)
+        txt(xe,yy+13,pct(perf(totals[k],targets[k])),20,'#b9f2d6',True)
+        if xs is not None: txt(xs,yy+13,f'{100*totals[k]/totals["sales"] if totals["sales"] else 0:.1f}%',19,'white',True)
     rect(14,1522,837,1816,'white',20); rect(851,1522,1686,1816,'white',20)
     rect(30,1539,822,1598,'#dcf6e9',13); rect(866,1539,1670,1598,'#fbe5e8',13)
     txt(51,1551,'🏆 ТОП-3  •  ОБОРОТ',29,'#07854e',True)
@@ -2468,6 +2468,9 @@ def interim_dashboard(report_day, slot, rate, data):
                 txt(x+745,y,money(actual)+' ₴',17,muted,False,'ra')
                 if i<2: d.line((x,y+46,x+765,y+46),fill='#e5edf6',width=2)
     txt(26,1844,'Дані 1С  •  Плани в грн за обліковим курсом  •  Повернення враховано в обороті',18,muted)
+    from PIL import ImageEnhance, ImageFilter
+    im=ImageEnhance.Contrast(im).enhance(1.07)
+    im=im.filter(ImageFilter.UnsharpMask(radius=1.2,percent=145,threshold=2))
     buf=io.BytesIO(); im.save(buf,format='PNG',optimize=True); buf.seek(0)
     buf.name=f'moyo_interim_{report_day:%Y%m%d}_{slot}.png'
     return buf
