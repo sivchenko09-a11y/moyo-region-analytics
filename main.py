@@ -2284,6 +2284,240 @@ async def automatic_startup_test(app):
     except Exception:
         log.exception("AUTO TEST FAILED: report not sent")
 
+# ---- Interim 1C report (Google Sheets) ----
+INTERIM_SHEET_ID = os.getenv('INTERIM_SHEET_ID', '18jazHrriQXyfQxbDohZJmHPl1l6XR9706e9tuHZ1vsc').strip()
+
+def _interim_number(value):
+    if value is None or str(value).strip() == '':
+        return 0.0
+    try:
+        return float(str(value).replace('\u00a0', '').replace(' ', '').replace(',', '.').replace('₴', ''))
+    except (ValueError, TypeError):
+        raise ValueError(f'Некоректна сума в 1С: {value!r}')
+
+def parse_interim_rows(rows, report_day):
+    """Read ONLY store subtotals; receipt/date rows are deliberately ignored."""
+    import hashlib
+    header_text = '\n'.join(str(c) for row in rows[:8] for c in row)
+    match = re.search(r'курс[^\n]*?\b(?:на\s+\d{2}\.\d{2}\.\d{4}\s*[-–:]\s*)(\d+[,.]\d+)', header_text, re.I)
+    if not match:
+        raise ValueError('У заголовку 1С не знайдено обліковий курс. Очікується «Учетный курс ... - 45,4».')
+    rate = _interim_number(match.group(1))
+    if not (0 < rate < 1000):
+        raise ValueError('Некоректний курс 1С.')
+    header_index = next((i for i, row in enumerate(rows) if any(str(x).strip() == 'Дата продажи' for x in row)
+                         and any(str(x).strip() == 'Сумма всего ТО' for x in row)), None)
+    if header_index is None:
+        raise ValueError('Не знайдено заголовки «Дата продажи / Сумма всего ТО».')
+    data = {}
+    for row in rows[header_index + 1:]:
+        if not row:
+            continue
+        name = str(row[0]).strip()
+        if name not in STORE_ORDER:
+            continue
+        if name in data:
+            raise ValueError(f'Повторний підсумковий рядок магазину {name}.')
+        data[name] = {'sales': _interim_number(row[1] if len(row)>1 else None),
+                      'accessories': _interim_number(row[2] if len(row)>2 else None),
+                      'services': _interim_number(row[3] if len(row)>3 else None)}
+    if not data:
+        raise ValueError('Не знайдено жодного підсумкового рядка магазину.')
+    # Hash of meaningful source values, independent of receipt count and cell formatting.
+    canonical = json.dumps({'rate': rate, 'stores': data}, sort_keys=True, ensure_ascii=False)
+    signature = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+    return rate, data, signature
+
+def fetch_interim_sheet(report_day):
+    from google.oauth2.service_account import Credentials
+    from google.auth.transport.requests import AuthorizedSession
+    from urllib.parse import quote
+    config = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
+    if not config:
+        raise ValueError('Немає GOOGLE_SERVICE_ACCOUNT_JSON у Railway.')
+    credentials = Credentials.from_service_account_info(json.loads(config), scopes=['https://www.googleapis.com/auth/spreadsheets.readonly'])
+    with AuthorizedSession(credentials) as session:
+        metadata = session.get(f'https://sheets.googleapis.com/v4/spreadsheets/{INTERIM_SHEET_ID}',
+                               params={'fields':'sheets.properties.title'},timeout=45)
+        metadata.raise_for_status()
+        title = sheet_dates(metadata.json()).get(report_day.isoformat())
+        if not title:
+            raise ValueError(f'Немає вкладки {report_day:%d.%m.%Y} у проміжковій таблиці.')
+        address = quote("'" + title.replace("'", "''") + "'", safe='')
+        response = session.get(f'https://sheets.googleapis.com/v4/spreadsheets/{INTERIM_SHEET_ID}/values/{address}',
+                               params={'valueRenderOption':'FORMATTED_VALUE'},timeout=45)
+        response.raise_for_status()
+        return parse_interim_rows(response.json().get('values', []), report_day)
+
+def interim_dashboard(report_day, slot, rate, data):
+    """Render the approved dense MOYO dashboard: grouped plan/fact/%/share columns."""
+    from PIL import Image, ImageDraw, ImageFont
+    from matplotlib import font_manager
+    W,H=1700,1900
+    im=Image.new('RGB',(W,H),'#e7f2ff'); d=ImageDraw.Draw(im)
+    regular=font_manager.findfont(font_manager.FontProperties(family='DejaVu Sans'))
+    bold=font_manager.findfont(font_manager.FontProperties(family='DejaVu Sans',weight='bold'))
+    fonts={}
+    def ft(n,b=False):
+        key=(n,b)
+        if key not in fonts: fonts[key]=ImageFont.truetype(bold if b else regular,n)
+        return fonts[key]
+    def rect(x0,y0,x1,y1,fill,r=16,outline=None):
+        d.rounded_rectangle((x0,y0,x1,y1),radius=r,fill=fill,outline=outline,width=2 if outline else 1)
+    def txt(x,y,v,n=20,c='#173455',b=False,anchor=None):
+        d.text((x,y),str(v),font=ft(n,b),fill=c,anchor=anchor)
+    def money(v): return f'{v:,.0f}'.replace(',',' ')
+    def pct(v): return '—' if v is None else f'{v:.1f}%'
+    def color(v): return '#079e5c' if v is not None and v>=100 else '#bf8700' if v is not None and v>=70 else '#d62735'
+    month_days=calendar.monthrange(report_day.year,report_day.month)[1]
+    plans=load_monthly_plans(report_day.strftime('%Y-%m'))
+    results=[]
+    for store in STORE_ORDER:
+        values=data.get(store,{'sales':0,'accessories':0,'services':0})
+        targets={}
+        for k in ('sales','accessories','services'):
+            try:
+                v=plans.loc[store,k]
+                targets[k]=float(v)*rate/month_days if pd.notna(v) else None
+            except (KeyError,TypeError,ValueError): targets[k]=None
+        results.append((store,values,targets))
+    totals={k:sum(v[k] for _,v,_ in results) for k in ('sales','accessories','services')}
+    targets={k:sum(p[k] for _,_,p in results) if all(p[k] is not None for _,_,p in results) else None for k in totals}
+    def perf(actual,plan): return 100*actual/plan if plan is not None and plan>0 else None
+    navy='#10355e'; muted='#52677f'
+    rect(14,14,W-14,145,navy,24)
+    txt(40,27,'MOYO  |  ПРОМІЖКОВИЙ ЗВІТ',46,'white',True)
+    txt(42,91,'РЕГІОН — ЦЕНТР    •    ДЕНЬ В ДЕНЬ',23,'#c7e1fa')
+    txt(W-36,33,report_day.strftime('%d.%m.%Y'),29,'white',True,'ra')
+    txt(W-36,80,f'Після {slot}:00   |   Курс {rate:g} грн/$',23,'#dcecff',True,'ra')
+    cards=[('ОБОРОТ','sales','#216dc4'),('АКСЕСУАРИ','accessories','#0e9962'),('ПОСЛУГИ','services','#b63f62')]
+    cw=(W-56)//3
+    for i,(label,k,accent) in enumerate(cards):
+        x=14+i*(cw+14); rect(x,160,x+cw,495,'white',21)
+        rect(x+18,180,x+65,229,accent,12)
+        txt(x+78,184,label,27,navy,True)
+        txt(x+31,186,{'sales':'▣','accessories':'◇','services':'✦'}[k],27,'white',True)
+        txt(x+20,239,money(totals[k])+' ₴',39,accent if k!='sales' else navy,True)
+        p=perf(totals[k],targets[k]); rect(x+cw-161,178,x+cw-18,228,'#e1f4e9' if p is not None and p>=100 else '#e9f0fa',12)
+        txt(x+cw-90,187,pct(p),25,color(p),True,'ma')
+        txt(x+22,308,'План, грн',20,muted)
+        txt(x+cw-20,308,money(targets[k]) if targets[k] is not None else '—',22,navy,True,'ra')
+        d.line((x+20,341,x+cw-20,341),fill='#e4edf7',width=2)
+        txt(x+22,350,'Факт, грн',20,muted)
+        txt(x+cw-20,350,money(totals[k]),22,navy,True,'ra')
+        d.line((x+20,386,x+cw-20,386),fill='#e4edf7',width=2)
+        txt(x+22,397,'Виконання',20,muted)
+        txt(x+cw-20,397,pct(p),22,color(p),True,'ra')
+        rect(x+20,446,x+cw-20,461,'#dce7f3',8)
+        if p is not None and p>0: rect(x+20,446,x+20+(cw-40)*min(p,100)/100,461,accent,8)
+        if k!='sales':
+            share=100*totals[k]/totals['sales'] if totals['sales'] else 0
+            txt(x+cw-20,470,f'Частка: {share:.2f}%',17,muted,False,'ra')
+    rect(14,511,W-14,1505,'white',20)
+    txt(36,526,'МАГАЗИНИ — ВИКОНАННЯ ПЛАНУ',34,navy,True)
+    # Widths: store 248; turnover 405; accessories 505; services 505
+    x0=30; boundaries=[x0,280,680,1182,1670]
+    rect(30,587,1670,687,navy,12)
+    txt(43,621,'Магазин',22,'white',True)
+    for mid,name in ((480,'ОБОРОТ'),(931,'АКСЕСУАРИ'),(1426,'ПОСЛУГИ')):
+        txt(mid,595,name,23,'white',True,'ma')
+    columns=[(295,'План'),(399,'Факт'),(573,'%'),(695,'План'),(807,'Факт'),(939,'%'),(1075,'Частка'),(1198,'План'),(1310,'Факт'),(1441,'%'),(1576,'Частка')]
+    for x,label in columns: txt(x,645,label,17,'#dcecff',True)
+    for x in boundaries[1:-1]: d.line((x,587,x,1490),fill='#d0dce9',width=2)
+    short={'Буча-Рітейл Парк':'Буча-Рітейл','Київ-Аладдін':'Аладін','Київ-Аркадія':'Аркадія','Київ-Блокбастер':'Блокбастер','Київ-Дрімтаун_new':'Дрім Таун','Київ-Квадрат':'Квадрат','Київ-Комод':'Комод','Київ-Лавіна Молл':'Лавіна','Київ-Материк':'Материк','Київ-Нью Вей':'Нью Вей','Київ-Олімпійський':'Олімпійський','Київ-Республіка Парк':'Республіка Парк','Київ-Ретровіль':'Ретровіль','Київ-Хрещатик 21':'Хрещатик 21'}
+    rowh=54
+    for i,(store,vals,plan) in enumerate(results):
+        y=690+i*rowh
+        if i%2==0: rect(30,y,1670,y+rowh-2,'#eef5fd',5)
+        txt(43,y+15,short.get(store,store),18,navy,True)
+        for k,xp,xf,xe,xs in (('sales',295,399,573,None),('accessories',695,807,939,1075),('services',1198,1310,1441,1576)):
+            pp=perf(vals[k],plan[k]); share=100*vals[k]/vals['sales'] if vals['sales'] else 0
+            txt(xp,y+16,money(plan[k]) if plan[k] is not None else '—',17,navy)
+            txt(xf,y+16,money(vals[k]),18,navy,True)
+            if pp is not None:
+                badge_x=xe-13
+                rect(badge_x,y+8,badge_x+90,y+44,
+                     '#dff7e9' if pp>=100 else '#fff1ce' if pp>=70 else '#ffe3e8',9)
+                txt(badge_x+45,y+13,pct(pp),17,color(pp),True,'ma')
+            if xs is not None: txt(xs,y+16,f'{share:.1f}%',17,muted,True)
+    yy=690+14*rowh+5
+    rect(30,yy,1670,yy+53,navy,8)
+    txt(43,yy+13,'РАЗОМ',20,'white',True)
+    for k,xp,xf,xe,xs in (('sales',295,399,573,None),('accessories',695,807,939,1075),('services',1198,1310,1441,1576)):
+        txt(xp,yy+15,money(targets[k]) if targets[k] is not None else '—',17,'white')
+        txt(xf,yy+15,money(totals[k]),18,'white',True)
+        txt(xe,yy+15,pct(perf(totals[k],targets[k])),18,'#b9f2d6',True)
+        if xs is not None: txt(xs,yy+15,f'{100*totals[k]/totals["sales"] if totals["sales"] else 0:.1f}%',17,'white')
+    rect(14,1522,837,1816,'white',20); rect(851,1522,1686,1816,'white',20)
+    rect(30,1539,822,1598,'#dcf6e9',13); rect(866,1539,1670,1598,'#fbe5e8',13)
+    txt(51,1551,'🏆 ТОП-3  •  ОБОРОТ',29,'#07854e',True)
+    txt(885,1551,'↓ АНТИТОП-3  •  ОБОРОТ',29,'#c82e43',True)
+    ranking=[(store,perf(vals['sales'],plan['sales']),vals['sales']) for store,vals,plan in results]
+    ranking=[v for v in ranking if v[1] is not None]
+    ranking.sort(key=lambda z:z[1],reverse=True)
+    if not ranking:
+        txt(55,1650,'Плани ще не завантажені',22,muted)
+        txt(885,1650,'Плани ще не завантажені',22,muted)
+    else:
+        for x,group in ((50,ranking[:3]),(870,list(reversed(ranking[-3:])))):
+            for i,(store,pc,actual) in enumerate(group):
+                y=1620+i*60
+                txt(x,y,f'{i+1}. {short.get(store,store)}',20,navy,True)
+                txt(x+530,y,pct(pc),21,color(pc),True)
+                txt(x+745,y,money(actual)+' ₴',17,muted,False,'ra')
+                if i<2: d.line((x,y+46,x+765,y+46),fill='#e5edf6',width=2)
+    txt(26,1844,'Дані 1С  •  Плани в грн за обліковим курсом  •  Повернення враховано в обороті',18,muted)
+    buf=io.BytesIO(); im.save(buf,format='PNG',optimize=True); buf.seek(0)
+    buf.name=f'moyo_interim_{report_day:%Y%m%d}_{slot}.png'
+    return buf
+
+def interim_db():
+    conn=db()
+    conn.execute('CREATE TABLE IF NOT EXISTS interim_sent (day TEXT, slot INTEGER, chat_id TEXT, signature TEXT, PRIMARY KEY(day,slot,chat_id))')
+    return conn
+
+async def interim_loop(app):
+    """Poll once per minute, send once per slot after two identical reads."""
+    previous=None
+    while True:
+        await asyncio.sleep(60)
+        if not GROUP_CHAT_ID:
+            continue
+        now=datetime.now(REPORT_TZ)
+        slot=21 if now.hour>=21 else 15 if now.hour>=15 else None
+        if slot is None:
+            previous=None
+            continue
+        day=now.date()
+        conn=interim_db()
+        try:
+            already=conn.execute('SELECT signature FROM interim_sent WHERE day=? AND slot=? AND chat_id=?',
+                                 (day.isoformat(),slot,str(GROUP_CHAT_ID))).fetchone()
+            earlier=conn.execute('SELECT signature FROM interim_sent WHERE day=? AND slot=15 AND chat_id=?',
+                                 (day.isoformat(),str(GROUP_CHAT_ID))).fetchone() if slot==21 else None
+        finally: conn.close()
+        if already:
+            continue
+        try:
+            rate,data,signature=await asyncio.to_thread(fetch_interim_sheet,day)
+            if earlier and earlier[0]==signature:
+                continue # No new 1C numbers since afternoon; never resend stale data.
+            key=(day.isoformat(),slot,signature)
+            if previous!=key:
+                previous=key
+                continue # wait for another poll to ensure Google Sheet upload finished
+            picture=await asyncio.to_thread(interim_dashboard,day,slot,rate,data)
+            await app.bot.send_photo(chat_id=int(GROUP_CHAT_ID),photo=picture,
+                 caption=f'📊 МОЙО — проміжковий звіт за {day:%d.%m.%Y} (після {slot}:00)')
+            conn=interim_db()
+            try:
+                with conn: conn.execute('INSERT OR REPLACE INTO interim_sent VALUES (?,?,?,?)',
+                                       (day.isoformat(),slot,str(GROUP_CHAT_ID),signature))
+            finally: conn.close()
+        except Exception:
+            log.exception('Interim report poll failed; will retry')
+
+
 async def setup_group_schedule(app):
     await setup_commands(app)
     app.create_task(digest_loop(app), name="group-digest-12-kyiv")
@@ -2291,6 +2525,7 @@ async def setup_group_schedule(app):
         app.create_task(automatic_startup_test(app), name="automatic-startup-test-5min")
     app.create_task(extra_digest_loop(app,"week"), name="weekly-digest-kyiv")
     app.create_task(extra_digest_loop(app,"month"), name="monthly-trend-kyiv")
+    app.create_task(interim_loop(app), name="interim-sales-watch-kyiv")
 
 
 def main():
