@@ -1875,7 +1875,7 @@ def digest_dashboard(day):
     focus=focus_data()
     if not any(k[1]==key for k in focus):
         raise ValueError('Немає фокусів за звітний день')
-    W=1120; row_h=47; H=1050+len(ranking)*row_h
+    W=1120; row_h=47; H=1320+len(ranking)*row_h
     im=Image.new('RGB',(W,H),'#eaf2fb'); d=ImageDraw.Draw(im)
     # Matplotlib bundles DejaVu TTF fonts with full Ukrainian Cyrillic support.
     # Install matplotlib in requirements.txt on Railway.
@@ -1910,6 +1910,7 @@ def digest_dashboard(day):
     txt(875,42,day.strftime('%d.%m.%Y'),24,'white',True)
     rect(18,110,535,445,'white'); rect(550,110,1102,445,'white')
     txt(38,128,'ФІНАНСОВІ ПОКАЗНИКИ',24,bold=True)
+    total_sales=float(frame['sales'].sum())
     for i,(metric,label) in enumerate([('sales','Оборот'),('direct','Прямі продажі'),('pickup','Пікап'),('accessories','Аксесуари'),('services','Послуги')]):
         y=175+i*51
         rect(37,y,515,y+43,'#eef4fa',9)
@@ -1917,6 +1918,10 @@ def digest_dashboard(day):
         amount=money(frame[metric].sum())
         bbox=d.textbbox((0,0),amount,font=f(22,True))
         txt(499-(bbox[2]-bbox[0]),y+7,amount,22,bold=True)
+        if metric in ('accessories','services'):
+            share = float(frame[metric].sum())/total_sales*100 if total_sales else None
+            share_label = f'Частка {share:.2f}%' if share is not None else 'Частка н/д'
+            txt(280,y+13,share_label,15,'#42658b',True)
     txt(570,128,'ВИКОНАННЯ ДЕННОГО ПЛАНУ',23,bold=True)
     for i,(label,val) in enumerate(region):
         cx=645+i*176; cy=272
@@ -1941,7 +1946,25 @@ def digest_dashboard(day):
             col='#11834a' if v is not None and v>=100 else '#d4424b' if v is not None and v<90 else '#bb8500'
             txt(x,y+9,pct(v),19,col,True)
             bar(x+105,y+16,100,v)
+    # Top / bottom 3 stores by turnover daily plan attainment.
     y=table_end+16
+    rect(18,y,1102,y+224,'white')
+    txt(39,y+13,'ТОП / АНТИТОП МАГАЗИНІВ — ОБОРОТ',25,bold=True)
+    txt(48,y+57,'ТОП 3',22,'#11834a',True)
+    txt(580,y+57,'АНТИТОП 3',22,'#d4424b',True)
+    eligible=[(store,vals[0]) for store,vals in ranking if vals[0] is not None]
+    leaders=eligible[:3]
+    laggards=list(reversed(eligible[-3:]))
+    for i in range(3):
+        yy=y+94+i*39
+        for x,items,color in ((48,leaders,'#11834a'),(580,laggards,'#d4424b')):
+            if i>=len(items):
+                continue
+            store,value=items[i]
+            name=aliases.get(store,store.removeprefix('Київ-'))[:21]
+            txt(x,yy,f'{i+1}. {name}',19,bold=True)
+            txt(x+370,yy,pct(value),19,color,True)
+    y+=240
     rect(18,y,1102,y+238,'white')
     txt(39,y+14,f'ТРЕНД РЕГІОНУ | 01.{trend_day:%m.%Y}–{trend_day:%d.%m.%Y}',25,bold=True)
     for i,(label,value,actual,forecast) in enumerate(trends):
@@ -1975,8 +1998,8 @@ async def send_digest(bot, chat_id, day, force=False):
     if already and not force:
         return False
     picture = await asyncio.to_thread(digest_dashboard, day)
-    await bot.send_document(chat_id=int(chat_id), document=picture,
-                            caption=f"📊 МОЙО — звіт за {day:%d.%m.%Y} | тренд регіону")
+    await bot.send_photo(chat_id=int(chat_id), photo=picture,
+                         caption=f"📊 МОЙО — звіт за {day:%d.%m.%Y} | тренд регіону")
     conn = digest_db()
     try:
         with conn:
