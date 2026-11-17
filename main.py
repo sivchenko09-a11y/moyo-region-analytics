@@ -1877,33 +1877,25 @@ def digest_dashboard(day):
         raise ValueError('Немає фокусів за звітний день')
     W=1120; row_h=47; H=1050+len(ranking)*row_h
     im=Image.new('RGB',(W,H),'#eaf2fb'); d=ImageDraw.Draw(im)
-    # Railway images do not always include system TTF fonts.
-    # Prefer installed Unicode fonts; fall back to Pillow's bundled font.
+    # Matplotlib bundles DejaVu TTF fonts with full Ukrainian Cyrillic support.
+    # Install matplotlib in requirements.txt on Railway.
     from pathlib import Path as _FontPath
-    _font_dirs = [
-        '/usr/share/fonts/truetype/dejavu',
-        '/usr/share/fonts/truetype/liberation2',
-        '/usr/share/fonts/truetype/noto',
-        '/usr/local/share/fonts',
-        '/app/fonts',
-    ]
+    try:
+        import matplotlib
+        _mpl_fonts = _FontPath(matplotlib.get_data_path()) / "fonts" / "ttf"
+    except ImportError as exc:
+        raise RuntimeError(
+            "Для українських написів на картинці додай matplotlib>=3.8 "
+            "до requirements.txt та повторно розгорни Railway."
+        ) from exc
+
     def f(size, bold=False):
-        names = (['DejaVuSans-Bold.ttf', 'LiberationSans-Bold.ttf',
-                  'NotoSans-Bold.ttf', 'Arial-Bold.ttf'] if bold else
-                 ['DejaVuSans.ttf', 'LiberationSans-Regular.ttf',
-                  'NotoSans-Regular.ttf', 'Arial.ttf'])
-        for directory in _font_dirs:
-            for name in names:
-                path = _FontPath(directory) / name
-                if path.is_file():
-                    try:
-                        return ImageFont.truetype(str(path), size)
-                    except OSError:
-                        pass
-        try:
-            return ImageFont.load_default(size=size)
-        except TypeError:
-            return ImageFont.load_default()
+        name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+        path = _mpl_fonts / name
+        if not path.is_file():
+            raise RuntimeError(f"Не знайдено шрифт з підтримкою кирилиці: {path}")
+        return ImageFont.truetype(str(path), size)
+
     def rect(x0,y0,x1,y1,fill,r=18): d.rounded_rectangle((x0,y0,x1,y1),radius=r,fill=fill)
     def txt(x,y,t,size=22,color='#172d4a',bold=False): d.text((x,y),str(t),font=f(size,bold),fill=color)
     def money(v): return '$'+format(round(v),',').replace(',',' ')
