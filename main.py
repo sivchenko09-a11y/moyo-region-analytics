@@ -1770,42 +1770,54 @@ def group_report_text(day):
             value = frame[metric].sum() / target * 100
             icon = "🟢" if value >= 100 else "🟡" if value >= 90 else "🔴"
             lines.append(f"{icon} {label}: {value:.2f}%")
-    lines.extend(["", "🏬 МАГАЗИНИ — ВИКОНАННЯ ПЛАНУ", "Оборот | Акс. | Послуги"])
+    lines.extend(["", "🏬 МАГАЗИНИ — ВИКОНАННЯ ПЛАНУ", "[[TABLE]]"])
     ranking = []
     for _, row in frame.iterrows():
         result = []
+        raw_values = []
         for metric, _ in metrics:
             if row.store not in plans.index or pd.isna(plans.loc[row.store, metric]):
-                result.append("⚪ н/д")
+                result.append("⚪    н/д")
+                raw_values.append(None)
                 continue
             target = float(plans.loc[row.store, metric]) / days
             if target <= 0:
-                result.append("⚪ н/д")
+                result.append("⚪    н/д")
+                raw_values.append(None)
                 continue
             value = float(row[metric]) / target * 100
-            icon = "🟢" if value >= 100 else "🟡" if value >= 90 else "🔴"
-            result.append(f"{icon} {value:.1f}%")
-        ranking.append((float(row.sales) / (float(plans.loc[row.store, "sales"]) / days)
-                        if row.store in plans.index and pd.notna(plans.loc[row.store, "sales"])
-                        and float(plans.loc[row.store, "sales"]) > 0 else -1,
-                        row.store, result))
+            icon = "🟢" if value >= 100 else "🔴"
+            result.append(f"{icon} {value:6.1f}%")
+            raw_values.append(value)
+        ranking.append((raw_values[0] if raw_values[0] is not None else -1,
+                        str(row.store), result))
+    # Short names keep all three percentage columns aligned on mobile.
+    aliases = {
+        "Київ-Олімпійський": "Олімпійський", "Київ-Аркадія": "Аркадія",
+        "Київ-Нью Вей": "Нью Вей", "Київ-Хрещатик 21": "Хрещатик",
+        "Київ-Аладдін": "Аладін", "Київ-Комод": "Комод",
+        "Буча-Рітейл Парк": "Буча", "Київ-Квадрат": "Квадрат",
+        "Київ-Материк": "Материк", "Київ-Ретровіль": "Ретровіль",
+        "Київ-Дрімтаун_new": "Дрім Таун", "Київ-Лавіна Молл": "Лавіна",
+        "Київ-Республіка Парк": "Республіка", "Київ-Блокбастер": "Блокбастер",
+    }
+    # All three metric cells have identical display widths, including emoji.
+    # Telegram HTML <pre> renders the grid with a monospaced font.
+    lines.append(f"{'Магазин':<15} {'ТО':>10} {'Акс':>10} {'Посл':>10}")
     for _, store, result in sorted(ranking, key=lambda item: item[0], reverse=True):
-        lines.append(f"• {store}: {' | '.join(result)}")
+        short = aliases.get(store, store.removeprefix("Київ-"))
+        # A colored circle occupies two terminal columns; 1 separator + 6 digits + %.
+        cells = [cell.ljust(9) for cell in result]
+        lines.append(f"{short[:15]:<15} {cells[0]} {cells[1]} {cells[2]}")
+    lines.append("[[/TABLE]]")
     data = focus_data()
     if not data or not any(d == key for _, d in data):
         raise ValueError(f"Немає фокусів за {day:%d.%m.%Y}.")
-    # Group digest: only ЕЗ and Клімат, with year-over-year comparison.
-    # Interactive /focus reports remain unchanged.
+    # Group digest: only daily ЕЗ and Клімат facts; /focus is unchanged.
     lines.extend(["", "🎯 ФОКУСИ ЗА ВЧОРА — ЕЗ / КЛІМАТ"])
     for category in ("ЕЗ", "Клімат"):
         unit = FOCUS_CONFIG[category][1]
         lines.extend(["", category, f"Факт: {focus_pair(data, category, unit, day, day)}"])
-        previous_year = focus_comparison_date(day, day.year - 1, day.month)
-        if previous_year is None:
-            lines.append("Рік до Року: немає аналогічної календарної дати")
-        else:
-            lines.append("Рік до Року: " + focus_pair_change(
-                data, category, unit, previous_year, previous_year, day, day))
     return "\n".join(lines)
 
 def digest_db():
@@ -1832,8 +1844,22 @@ async def send_digest(bot, chat_id, day, force=False):
         chunk += line + "\n"
     if chunk:
         chunks.append(chunk)
+    import html
     for part in chunks:
-        await bot.send_message(chat_id=int(chat_id), text=bold_report_percentages(part), parse_mode="HTML")
+        rendered = []
+        in_table = False
+        for line in part.splitlines():
+            if line == "[[TABLE]]":
+                rendered.append("<pre>")
+                in_table = True
+            elif line == "[[/TABLE]]":
+                rendered.append("</pre>")
+                in_table = False
+            elif in_table:
+                rendered.append(html.escape(line))
+            else:
+                rendered.append(bold_report_percentages(line))
+        await bot.send_message(chat_id=int(chat_id), text="\n".join(rendered), parse_mode="HTML")
     conn = digest_db()
     try:
         with conn:
