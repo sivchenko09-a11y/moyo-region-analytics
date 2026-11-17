@@ -1853,11 +1853,21 @@ async def group_test(update, context):
         return
     day = datetime.now(REPORT_TZ).date() - timedelta(days=1)
     try:
+        await update.message.reply_text("🔄 Оновлюю продажі, плани та фокуси з Google Sheets перед тестом…")
+        await asyncio.to_thread(sync_google_sheets)
+        await asyncio.to_thread(sync_focus_google)
         await send_digest(context.bot, chat_id, day, force=True)
         await update.message.reply_text(f"Тестовий звіт за {day:%d.%m.%Y} надіслано.")
     except Exception as exc:
         log.exception("Test group digest failed")
-        await update.message.reply_text(f"Тест не надіслано: {exc}")
+        frames = daily_frames()
+        available = sorted(frames)
+        recent = ", ".join(available[-5:]) if available else "жодної"
+        await update.message.reply_text(
+            f"Тест не надіслано: {exc}\nОстанні дати продажів у базі: {recent}.\n"
+            "Перевір, що в таблицях Продажі та Якісні є вкладки з однаковою датою, "
+            "а для розрахунку денного виторгу є також попередній день."
+        )
 
 async def digest_loop(app):
     while True:
