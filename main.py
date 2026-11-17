@@ -4,7 +4,7 @@ import re
 import io
 import sqlite3
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -270,8 +270,149 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for offset in range(0, len(report), 4000):
         await update.message.reply_text(report[offset:offset + 4000])
 
+async def store_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    conn = db()
+    try:
+        report_date = conn.execute("SELECT MAX(report_date) FROM snapshots").fetchone()[0]
+    finally:
+        conn.close()
+    if not report_date:
+        await update.message.reply_text("Спочатку надішли звіт.")
+        return
+    current = get_snapshot(report_date)
+    query = norm(" ".join(context.args))
+    stores = current["store"].tolist()
+    if not query:
+        await update.message.reply_text(
+            "Введи назву, наприклад /store Ретровіль\n\nМагазини в останньому звіті:\n"
+            + "\n".join(stores)
+        )
+        return
+    exact = [name for name in stores if norm(name) == query]
+    matches = exact or [name for name in stores if query in norm(name)]
+    if len(matches) != 1:
+        message = ("Уточни назву магазину:\n" + "\n".join(matches)
+                   if matches else "Магазин не знайдено. /store покаже доступні назви.")
+        await update.message.reply_text(message)
+        return
+    store = matches[0]
+    current = current[current["store"] == store].copy()
+    prev_date = previous_snapshot(report_date)
+    previous = get_snapshot(prev_date) if prev_date else None
+    if previous is not None:
+        previous = previous[previous["store"] == store].copy()
+    report = make_report(report_date, current, previous, prev_date)
+    report = report.replace(f"📊 РЕГІОН — {report_date}", f"📊 {store} — {report_date}", 1)
+    await update.message.reply_text(report)
+
+WEEK_METRICS = {
+    "sales": "Продажі", "direct": "Прямі", "pickup": "Пікап",
+    "services": "Послуги", "accessories": "Аксесуари",
+}
+
+
+def period_boundaries(start, end):
+    """Split cumulative monthly data into differences within each month."""
+    segments = []
+    while start <= end:
+        month_end = start.replace(day=calendar.monthrange(start.year, start.month)[1])
+        segment_end = min(end, month_end)
+        baseline = start - timedelta(days=1) if start.day > 1 else None
+        segments.append((baseline, segment_end))
+        start = segment_end + timedelta(days=1)
+    return segments
+
+
+def weekly_report(end, store=None):
+    # Use the latest complete Monday–Sunday week covered by the report date.
+    end -= timedelta(days=(end.weekday() + 1) % 7)
+    current_start = end - timedelta(days=6)
+    previous_end = current_start - timedelta(days=1)
+    previous_start = previous_end - timedelta(days=6)
+    periods = [period_boundaries(previous_start, previous_end),
+               period_boundaries(current_start, end)]
+    required = sorted({day for segments in periods for pair in segments
+                       for day in pair if day is not None})
+    snapshots = {day: get_snapshot(day.isoformat()) for day in required}
+    missing = []
+    for day, frame in snapshots.items():
+        if store:
+            frame = frame[frame["store"] == store]
+            snapshots[day] = frame
+        if frame.empty:
+            missing.append(day.strftime("%d.%m.%Y"))
+    if missing:
+        return ("Для порівняння потрібні накопичувальні звіти з початку відповідного місяця "
+                "по ці дати включно" + (f" для {store}" if store else "")
+                + ":\n" + "\n".join(missing))
+    store_sets = [set(frame["store"]) for frame in snapshots.values()]
+    if any(names != store_sets[0] for names in store_sets[1:]):
+        return ("Склад магазинів у звітах на граничні дати відрізняється. "
+                "Завантаж повні звіти з однаковим переліком магазинів або скористайся /week назва_магазину.")
+    totals = []
+    for segments in periods:
+        total = pd.Series(0.0, index=list(WEEK_METRICS))
+        for baseline, segment_end in segments:
+            total += snapshots[segment_end][list(WEEK_METRICS)].sum()
+            if baseline is not None:
+                total -= snapshots[baseline][list(WEEK_METRICS)].sum()
+        totals.append(total)
+    previous, current = totals
+    lines = [f"📊 ТИЖДЕНЬ ДО ТИЖНЯ — {store or 'РЕГІОН'}",
+             f"Попередній календарний тиждень: {previous_start:%d.%m.%Y}–{previous_end:%d.%m.%Y}",
+             f"Останній повний календарний тиждень: {current_start:%d.%m.%Y}–{end:%d.%m.%Y}",
+             "", "Попередній → поточний | зміна"]
+    for metric, label in WEEK_METRICS.items():
+        old, new = previous[metric], current[metric]
+        delta = new - old
+        relative = f"{delta / old * 100:+.2f}%" if old > 0 else "база для % відсутня або ≤ 0"
+        lines.append(f"• {label}: {fmt(old)} → {fmt(new)} | {delta:+,.0f} $ ({relative})".replace(",", " "))
+    return "\n".join(lines)
+
+
+async def week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    conn = db()
+    try:
+        latest = conn.execute("SELECT MAX(report_date) FROM snapshots").fetchone()[0]
+    finally:
+        conn.close()
+    if not latest:
+        await update.message.reply_text("Спочатку надішли звіт.")
+        return
+    args = list(context.args)
+    end = datetime.strptime(latest, "%Y-%m-%d").date()
+    if args and re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", args[-1]):
+        try:
+            end = datetime.strptime(args.pop(), "%d.%m.%Y").date()
+        except ValueError:
+            await update.message.reply_text("Некоректна дата. Приклад: /week Ретровіль 15.11.2026")
+            return
+    query = norm(" ".join(args))
+    store = None
+    if query and query != "регіон":
+        conn = db()
+        try:
+            stores = [row[0] for row in conn.execute("SELECT DISTINCT store FROM snapshots ORDER BY store")]
+        finally:
+            conn.close()
+        exact = [name for name in stores if norm(name) == query]
+        matches = exact or [name for name in stores if query in norm(name)]
+        if len(matches) != 1:
+            message = "Уточни назву:\n" + "\n".join(matches) if matches else "Магазин не знайдено. Перелік — /store."
+            await update.message.reply_text(message)
+            return
+        store = matches[0]
+    await update.message.reply_text(weekly_report(end, store))
+
+
 async def setup_commands(app):
     await app.bot.set_my_commands([
+        BotCommand("week", "Порівняння календарних тижнів Пн–Нд"),
+        BotCommand("store", "Показники конкретного магазину"),
         BotCommand("report", "Останній звіт і тренд регіону"),
         BotCommand("dates", "Збережені дати та кількість магазинів"),
         BotCommand("status", "Дата останнього звіту"),
@@ -365,6 +506,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("week", week_cmd))
+    app.add_handler(CommandHandler("store", store_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("dates", dates_cmd))
     app.add_handler(conv)
