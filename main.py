@@ -226,6 +226,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Надішли файл XLSX, XLS або CSV з накопичувальними даними з 01 числа. "
         "У підписі вкажи дату зрізу, наприклад: 16.11.2026.\n"
         "Команда /status покаже останню збережену дату.\n"
+        "/focus — фокуси й категорії: дата, місяць до місяця, рік до року, тиждень до тижня.\n"
         "/weeks — обрати тиждень за номером без порівняння.\n"
         "/week — порівняти календарні тижні."
     )
@@ -1201,6 +1202,266 @@ def sync_google_sheets():
     return result
 
 
+FOCUS_SHEET_ID = "1oGoXLgzy7sIp7tqg2oiziix3ImYZaFuyBnC-3CqfJ5Q"
+# Accepted headers prevent copied historical blocks of unrelated products being imported.
+FOCUS_CONFIG = {
+    "ЕЗ": ("ЕЗ", "шт.", {"ез"}),
+    "Клімат": ("Клімат", "шт.", {"клімат"}),
+    "Скріни": ("Скріни", "шт.", {"скрін"}),
+    "Вуха1": ("Вуха", "шт.", {"вуха"}),
+    "Павери": ("Павери", "шт.", {"павери"}),
+    "Носії1": ("Носії", "шт.", {"носії"}),
+    "Android": ("Android", "шт.", {"андроїд"}),
+    "Самсунг": ("Самсунг", "шт.", {"самсунг"}),
+    "Айфон": ("Айфон", "шт.", {"айфон"}),
+    "Ноутбуки": ("Ноутбуки", "шт.", {"ноути", "ноутбуки"}),
+    "PlayStation": ("PlayStation", "шт.", {"ps", "playstation"}),
+    "Акс PS": ("Акс PS", "шт.", {"акс ps"}),
+    "Закази з магазину": ("Замовлення з магазину", "$", {"закази з магазину"}),
+    "Виторг місяць + рік": ("Виторг", "$", {"оборот $"}),
+}
+
+
+def focus_header(value):
+    return re.sub(r"^(штуки|шт\.?)\s*", "", str(value).strip().lower()).strip()
+
+
+def focus_month(value):
+    if isinstance(value, datetime):
+        return value.year, value.month
+    if isinstance(value, (int, float)) and 30000 < value < 80000:
+        date = datetime(1899, 12, 30) + timedelta(days=value)
+        return date.year, date.month
+    for pattern in ("%m.%Y", "%d.%m.%Y", "%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            date = datetime.strptime(str(value).strip(), pattern)
+            return date.year, date.month
+        except ValueError:
+            pass
+    return None
+
+
+def parse_focus_sheets(sheets):
+    result = {}
+    found = set()
+    for title, rows in sheets.items():
+        key = title.strip()
+        if key not in FOCUS_CONFIG:
+            continue
+        category, unit, headers = FOCUS_CONFIG[key]
+        found.add(key)
+        for r, row in enumerate(rows[:5]):
+            for c, value in enumerate(row):
+                if str(value).strip().lower() != "день" or c + 2 >= len(row):
+                    continue
+                if focus_header(row[c+1]) not in headers:
+                    continue
+                month = focus_month(row[c+2])
+                if month is None:
+                    raise ValueError(f"Фокуси: {title}, не розпізнав місяць у колонці {c+3}.")
+                for values in rows[r+1:r+32]:
+                    if c+1 >= len(values):
+                        continue
+                    raw_day, raw = values[c], values[c+1]
+                    if raw is None or str(raw).strip() == "":
+                        continue
+                    try:
+                        day_number = float(raw_day)
+                        if not day_number.is_integer() or not 1 <= day_number <= 31:
+                            continue
+                        if day_number > calendar.monthrange(*month)[1]:
+                            continue  # Template has 31 rows even in shorter months.
+                        date = datetime(*month, int(day_number)).date().isoformat()
+                        quantity = float(re.sub(r"\s+", "", str(raw)).replace(",", "."))
+                    except (ValueError, TypeError):
+                        raise ValueError(f"Фокуси: {title}, день {raw_day} — некоректне число.")
+                    if not math.isfinite(quantity) or (unit == "шт." and not quantity.is_integer()):
+                        raise ValueError(f"Фокуси: {title}, {date} — перевір кількість.")
+                    identity = (category, date)
+                    if identity in result:
+                        raise ValueError(f"Фокуси: повтор {category} за {date}.")
+                    result[identity] = (date, category, unit, quantity)
+    missing = set(FOCUS_CONFIG) - found
+    if missing:
+        raise ValueError("Фокуси: не знайдено вкладки: " + ", ".join(sorted(missing)))
+    anchor = [date for category, date in result if category == "ЕЗ"]
+    if not anchor:
+        raise ValueError("Фокуси: немає заповнених днів ЕЗ для визначення останньої дати.")
+    cutoff = max(anchor)
+    # ЕЗ is the completion marker; blank future cells there exclude padded zeros elsewhere.
+    records = [row for row in result.values() if row[0] <= cutoff]
+    return records, cutoff
+
+
+def focus_db():
+    conn = db()
+    conn.execute("CREATE TABLE IF NOT EXISTS focus_reports (report_date TEXT, category TEXT, unit TEXT, value REAL, PRIMARY KEY(report_date, category))")
+    return conn
+
+
+def sync_focus_google():
+    from google.oauth2.service_account import Credentials
+    from google.auth.transport.requests import AuthorizedSession
+    from urllib.parse import quote
+    config = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not config:
+        raise ValueError("Додай GOOGLE_SERVICE_ACCOUNT_JSON у Railway.")
+    creds = Credentials.from_service_account_info(json.loads(config), scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+    with AuthorizedSession(creds) as session:
+        response = session.get(f"https://sheets.googleapis.com/v4/spreadsheets/{FOCUS_SHEET_ID}", params={"fields": "sheets.properties.title"}, timeout=45)
+        response.raise_for_status()
+        sheets = {}
+        for item in response.json().get("sheets", []):
+            title = item["properties"]["title"]
+            if title.strip() not in FOCUS_CONFIG:
+                continue
+            if any(t.strip() == title.strip() for t in sheets):
+                raise ValueError(f"Фокуси: дубль вкладки {title}.")
+            address = "'" + title.replace("'", "''") + "'!A1:ZZ40"
+            response = session.get(f"https://sheets.googleapis.com/v4/spreadsheets/{FOCUS_SHEET_ID}/values/{quote(address, safe='')}",
+                                   params={"valueRenderOption": "UNFORMATTED_VALUE", "dateTimeRenderOption": "SERIAL_NUMBER"}, timeout=45)
+            response.raise_for_status()
+            sheets[title] = response.json().get("values", [])
+    records, cutoff = parse_focus_sheets(sheets)
+    conn = focus_db()
+    try:
+        with conn:
+            conn.execute("DELETE FROM focus_reports")
+            conn.executemany("INSERT INTO focus_reports VALUES (?, ?, ?, ?)", records)
+    finally:
+        conn.close()
+    return f"Фокуси + категорії: {len(records)} записів, дані до {cutoff}. Перегляд — /focus."
+
+
+def focus_data():
+    conn = focus_db()
+    try:
+        return {(name, day): (unit, value) for day, name, unit, value in conn.execute("SELECT * FROM focus_reports")}
+    finally:
+        conn.close()
+
+
+def focus_value(value, unit):
+    if value is None:
+        return "немає даних"
+    return fmt(value) if unit == "$" else f"{value:,.0f} шт.".replace(",", " ")
+
+
+def focus_total(data, category, start, end):
+    values = [data.get((category, (start+timedelta(days=i)).isoformat()))
+              for i in range((end-start).days+1)]
+    return sum(v[1] for v in values) if values and all(v is not None for v in values) else None
+
+
+def focus_change(old, new, unit):
+    if old is None or new is None:
+        return "⚪ Немає повних даних для порівняння"
+    delta = new-old
+    icon = "🟢" if delta > 0 else "🔴" if delta < 0 else "⚪"
+    change = f"{delta/old*100:+.2f}%" if old > 0 else "немає додатної бази для %"
+    sign = "+" if delta > 0 else "−" if delta < 0 else ""
+    return f"{icon} {focus_value(old, unit)} → {focus_value(new, unit)}; {sign}{focus_value(abs(delta), unit)} ({change})"
+
+
+def focus_date_report(data, day):
+    lines = [f"🎯 Фокуси + категорії — РЕГІОН, {day:%d.%m.%Y}",
+             "Порівняння за однакову кількість днів із початку місяця."]
+    previous_month = day.replace(day=1)-timedelta(days=1)
+    for category, unit, _ in FOCUS_CONFIG.values():
+        month_total = focus_total(data, category, day.replace(day=1), day)
+        daily = data.get((category, day.isoformat()))
+        lines.extend(["", category, f"За день: {focus_value(daily[1] if daily else None, unit)}",
+                      f"01–{day.day:02}: {focus_value(month_total, unit)}"])
+        for label, year, month in (("Місяць до місяця", previous_month.year, previous_month.month),
+                                   ("Рік до року", day.year-1, day.month)):
+            count = min(day.day, calendar.monthrange(year, month)[1])
+            old_end = day.replace(year=year, month=month, day=count)
+            current_end = day.replace(day=count)
+            old = focus_total(data, category, old_end.replace(day=1), old_end)
+            new = focus_total(data, category, day.replace(day=1), current_end)
+            lines.append(f"{label} (01–{count:02}.{month:02}.{year} → 01–{count:02}.{day.month:02}.{day.year}): " + focus_change(old,new,unit))
+    return "\n".join(lines)
+
+
+def focus_week_report(data, monday):
+    latest = datetime.strptime(max(day for _, day in data), "%Y-%m-%d").date()
+    end = min(monday+timedelta(days=6), latest)
+    if end < monday:
+        return "За цей тиждень немає даних."
+    previous_start, previous_end = monday-timedelta(days=7), end-timedelta(days=7)
+    lines = ["🎯 Фокуси + категорії — РЕГІОН", week_title(monday),
+             f"Порівняння: {previous_start:%d.%m.%Y}–{previous_end:%d.%m.%Y} → {monday:%d.%m.%Y}–{end:%d.%m.%Y}"]
+    if (end-monday).days < 6:
+        lines.append("Неповний тиждень: порівнюються однакові дні тижня.")
+    for category, unit, _ in FOCUS_CONFIG.values():
+        old = focus_total(data, category, previous_start, previous_end)
+        new = focus_total(data, category, monday, end)
+        lines.extend(["", f"{category}: факт {focus_value(new,unit)}", focus_change(old,new,unit)])
+    return "\n".join(lines)
+
+
+async def focus_send(message, report):
+    # Split on lines so one category comparison is not cut in half.
+    chunk = ""
+    for line in report.splitlines():
+        if len(chunk)+len(line)+1 > 3500:
+            await message.reply_text(chunk)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk:
+        await message.reply_text(chunk)
+
+
+async def focus_cmd(update, context):
+    if not is_owner(update):
+        return
+    await update.message.reply_text("🎯 Фокуси + категорії — регіон\nОбери перегляд:", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 За датою · місяць і рік", callback_data="focus:dates:0")],
+        [InlineKeyboardButton("📊 Тиждень до тижня", callback_data="focus:weeks:0")]]))
+
+
+async def focus_selected(update, context):
+    query = update.callback_query
+    if not is_owner(update):
+        await query.answer("Доступ лише власнику.", show_alert=True)
+        return
+    await query.answer()
+    _, mode, value = query.data.split(":", 2)
+    data = focus_data()
+    if not data:
+        await query.message.reply_text("Спочатку онови фокуси через /sync.")
+        return
+    dates = sorted({day for _, day in data}, reverse=True)
+    if mode in ("dates", "weeks"):
+        if mode == "weeks":
+            choices = sorted({(datetime.strptime(day, "%Y-%m-%d").date()-timedelta(days=datetime.strptime(day, "%Y-%m-%d").weekday())).isoformat() for day in dates}, reverse=True)
+        else:
+            choices = dates
+        page = min(max(int(value), 0), (len(choices)-1)//15)
+        buttons = []
+        for date in choices[page*15:(page+1)*15]:
+            day = datetime.strptime(date, "%Y-%m-%d").date()
+            label = week_title(day) if mode == "weeks" else f"{day:%d.%m.%Y}"
+            action = "week" if mode == "weeks" else "date"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"focus:{action}:{date}")])
+        nav = []
+        if page:
+            nav.append(InlineKeyboardButton("Новіші", callback_data=f"focus:{mode}:{page-1}"))
+        if (page+1)*15 < len(choices):
+            nav.append(InlineKeyboardButton("Старіші", callback_data=f"focus:{mode}:{page+1}"))
+        if nav:
+            buttons.append(nav)
+        await query.message.reply_text("Обери тиждень:" if mode == "weeks" else "Обери дату:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+    day = datetime.strptime(value, "%Y-%m-%d").date()
+    if mode == "date" and value not in dates:
+        await query.message.reply_text("Цієї дати вже немає. Відкрий /focus знову.")
+        return
+    report = focus_week_report(data, day) if mode == "week" else focus_date_report(data, day)
+    await focus_send(query.message, report)
+
+
+
 async def sync_cmd(update, context):
     if not is_owner(update):
         return
@@ -1211,6 +1472,13 @@ async def sync_cmd(update, context):
     try:
         await update.message.reply_text("Читаю таблиці Google…")
         result = await asyncio.to_thread(sync_google_sheets)
+        try:
+            result += "\n" + await asyncio.to_thread(sync_focus_google)
+        except ValueError as exc:
+            result += "\nФокуси не оновлено: " + str(exc)
+        except Exception as exc:
+            log.error("Focus sync failed: %s", type(exc).__name__)
+            result += "\nФокуси не оновлено. Перевір доступ службового акаунта до таблиці Фокуси + категорії. Попередні дані фокусів збережені."
     except ImportError:
         result = "Додай google-auth[requests]>=2,<3 до requirements.txt та онови Railway."
     except ValueError as exc:
@@ -1226,6 +1494,7 @@ async def sync_cmd(update, context):
 
 async def setup_commands(app):
     await app.bot.set_my_commands([
+        BotCommand("focus", "🎯 Фокуси + категорії"),
         BotCommand("sync", "Оновити дані з Google Таблиць"),
         BotCommand("day", "Обрати дату та магазин або регіон"),
         BotCommand("weeks", "Тиждень за номером без порівняння"),
@@ -1339,6 +1608,8 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("sync", sync_cmd, block=False))
+    app.add_handler(CommandHandler("focus", focus_cmd))
+    app.add_handler(CallbackQueryHandler(focus_selected, pattern=r"^focus:(dates|weeks|date|week):"))
     app.add_handler(CommandHandler("day", day_cmd))
     app.add_handler(CallbackQueryHandler(day_selected, pattern=r"^day(page|date|pick):"))
     app.add_handler(CommandHandler("weeks", weeks_cmd))
