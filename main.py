@@ -2475,6 +2475,36 @@ def interim_dashboard(report_day, slot, rate, data):
     buf.name=f'moyo_interim_{report_day:%Y%m%d}_{slot}.png'
     return buf
 
+def refresh_interim_plans(report_day):
+    """Refresh only the plans sheet, without requiring today's sales/quality tabs."""
+    from google.oauth2.service_account import Credentials
+    from google.auth.transport.requests import AuthorizedSession
+    config = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not config:
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON не налаштовано")
+    credentials = Credentials.from_service_account_info(
+        json.loads(config), scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+    with AuthorizedSession(credentials) as session:
+        records = fetch_monthly_plans(session)
+    month = report_day.strftime("%Y-%m")
+    current = {store: (sales, accessories, services)
+               for m, store, sales, accessories, services in records if m == month}
+    missing = [store for store in STORE_ORDER
+               if store not in current or any(value is None for value in current[store])]
+    if missing:
+        raise ValueError("Немає повних планів за " + month + ": " + ", ".join(missing))
+    conn = db()
+    try:
+        with conn:
+            monthly_plans_db(conn)
+            conn.execute("DELETE FROM monthly_plans WHERE month = ?", (month,))
+            conn.executemany("INSERT INTO monthly_plans VALUES (?, ?, ?, ?, ?)",
+                             [(month, store, *current[store]) for store in STORE_ORDER])
+    finally:
+        conn.close()
+    return len(current)
+
+
 def interim_db():
     conn=db()
     conn.execute('CREATE TABLE IF NOT EXISTS interim_sent (day TEXT, slot INTEGER, chat_id TEXT, signature TEXT, PRIMARY KEY(day,slot,chat_id))')
@@ -2492,7 +2522,7 @@ async def interim_test(update, context):
             text=f"🔄 Читаю проміжкові продажі 1С за {day:%d.%m.%Y}…"
         )
         # Refresh monthly plans, so the image uses the newest plan figures.
-        await asyncio.to_thread(sync_google_sheets)
+        await asyncio.to_thread(refresh_interim_plans, day)
         rate, data, _ = await asyncio.to_thread(fetch_interim_sheet, day)
         slot = 21 if datetime.now(REPORT_TZ).hour >= 21 else 18 if datetime.now(REPORT_TZ).hour >= 18 else 15
         picture = await asyncio.to_thread(interim_dashboard, day, slot, rate, data)
@@ -2511,46 +2541,71 @@ async def interim_test(update, context):
 
 
 async def interim_loop(app):
-    """Poll once per minute for 15:00, 18:00, and 21:00 slots."""
-    previous=None
+    """Send only after a change observed during this process, never on Railway restart."""
+    baseline = None
+    pending = None
+    last_slot = None
     while True:
         await asyncio.sleep(60)
         if not GROUP_CHAT_ID:
             continue
-        now=datetime.now(REPORT_TZ)
-        slot=21 if now.hour>=21 else 18 if now.hour>=18 else 15 if now.hour>=15 else None
+        now = datetime.now(REPORT_TZ)
+        slot = 21 if now.hour >= 21 else 18 if now.hour >= 18 else 15 if now.hour >= 15 else None
         if slot is None:
-            previous=None
+            pending = None
             continue
-        day=now.date()
-        conn=interim_db()
+        day = now.date()
+        conn = interim_db()
         try:
-            already=conn.execute('SELECT signature FROM interim_sent WHERE day=? AND slot=? AND chat_id=?',
-                                 (day.isoformat(),slot,str(GROUP_CHAT_ID))).fetchone()
-            earlier=conn.execute('SELECT signature FROM interim_sent WHERE day=? AND slot=? AND chat_id=?',
-                                 (day.isoformat(),15 if slot==18 else 18,str(GROUP_CHAT_ID))).fetchone() if slot in (18,21) else None
-            if slot==21 and not earlier:
-                earlier=conn.execute('SELECT signature FROM interim_sent WHERE day=? AND slot=15 AND chat_id=?',
-                                     (day.isoformat(),str(GROUP_CHAT_ID))).fetchone()
-        finally: conn.close()
+            already = conn.execute(
+                'SELECT signature FROM interim_sent WHERE day=? AND slot=? AND chat_id=?',
+                (day.isoformat(), slot, str(GROUP_CHAT_ID))).fetchone()
+            earlier = conn.execute(
+                'SELECT signature FROM interim_sent WHERE day=? AND slot=? AND chat_id=?',
+                (day.isoformat(), 15 if slot == 18 else 18, str(GROUP_CHAT_ID))
+            ).fetchone() if slot in (18, 21) else None
+            if slot == 21 and not earlier:
+                earlier = conn.execute(
+                    'SELECT signature FROM interim_sent WHERE day=? AND slot=15 AND chat_id=?',
+                    (day.isoformat(), str(GROUP_CHAT_ID))).fetchone()
+        finally:
+            conn.close()
         if already:
             continue
         try:
-            rate,data,signature=await asyncio.to_thread(fetch_interim_sheet,day)
-            if earlier and earlier[0]==signature:
-                continue # No new 1C numbers since afternoon; never resend stale data.
-            key=(day.isoformat(),slot,signature)
-            if previous!=key:
-                previous=key
-                continue # wait for another poll to ensure Google Sheet upload finished
-            picture=await asyncio.to_thread(interim_dashboard,day,slot,rate,data)
-            await app.bot.send_photo(chat_id=int(GROUP_CHAT_ID),photo=picture,
-                 caption=f'📊 МОЙО — проміжковий звіт за {day:%d.%m.%Y} (після {slot}:00)')
-            conn=interim_db()
+            rate, data, signature = await asyncio.to_thread(fetch_interim_sheet, day)
+            # First successful observation after startup is a baseline, not a new upload.
+            # This avoids replaying existing Sheets data after every Railway deployment.
+            if baseline is None or baseline[0] != day.isoformat():
+                baseline = (day.isoformat(), signature)
+                pending = None
+                log.info('Interim watcher baseline initialized for %s; no startup send', day)
+                continue
+            if earlier and earlier[0] == signature:
+                pending = None
+                continue
+            if signature == baseline[1]:
+                pending = None
+                continue
+            key = (day.isoformat(), slot, signature)
+            if pending != key:
+                pending = key
+                continue  # Require unchanged data at two consecutive polls.
+            # Do not publish incomplete reports: all 14 stores need 3 valid plans.
+            await asyncio.to_thread(refresh_interim_plans, day)
+            picture = await asyncio.to_thread(interim_dashboard, day, slot, rate, data)
+            await app.bot.send_photo(
+                chat_id=int(GROUP_CHAT_ID), photo=picture,
+                caption=f'📊 МОЙО — проміжковий звіт за {day:%d.%m.%Y} (після {slot}:00)')
+            conn = interim_db()
             try:
-                with conn: conn.execute('INSERT OR REPLACE INTO interim_sent VALUES (?,?,?,?)',
-                                       (day.isoformat(),slot,str(GROUP_CHAT_ID),signature))
-            finally: conn.close()
+                with conn:
+                    conn.execute('INSERT OR REPLACE INTO interim_sent VALUES (?,?,?,?)',
+                                 (day.isoformat(), slot, str(GROUP_CHAT_ID), signature))
+            finally:
+                conn.close()
+            baseline = (day.isoformat(), signature)
+            pending = None
         except Exception:
             log.exception('Interim report poll failed; will retry')
 
