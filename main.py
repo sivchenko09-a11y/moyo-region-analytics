@@ -3138,7 +3138,8 @@ def cat_keyboard(options,kind='cat',page=0):
     if start+8<len(options):controls.append(InlineKeyboardButton('▶️',callback_data=f'cat:page:{page+1}'))
     if controls:buttons.append(controls)
     buttons.append([InlineKeyboardButton('📊 Аналіз цього рівня',callback_data='cat:report:0')])
-    buttons.append([InlineKeyboardButton('🔮 Прогноз наступного тижня',callback_data='cat:forecast:0')])
+    buttons.append([InlineKeyboardButton('🔮 Прогноз наступного тижня',callback_data='cat:forecast:week')])
+    buttons.append([InlineKeyboardButton('📆 Прогноз наступного місяця',callback_data='cat:forecast:month')])
     buttons.append([InlineKeyboardButton('⬅️ Назад',callback_data='cat:back:0')])
     return InlineKeyboardMarkup(buttons)
 
@@ -3227,7 +3228,7 @@ async def categories_callback(update,context):
         if i>=len(options):await q.message.reply_text('Список оновився. Відкрий /categories знову.');return
         state['path'].append(options[i]);state['page']=0
     elif kind=='forecast':
-        report=await asyncio.to_thread(category_forecast_text,state['path'],state['store'],state['source'])
+        report=await asyncio.to_thread(category_month_forecast_text if value=='month' else category_forecast_text,state['path'],state['store'],state['source'])
         for i in range(0,len(report),3500):await q.message.reply_text(report[i:i+3500])
         return
     elif kind=='report':
@@ -3405,6 +3406,82 @@ def category_forecast_text(path, store, source):
     lines.append('\n⚠️ Не враховано акції, залишки, поставки та зміни цін. Поточний незавершений тиждень не використовується.')
     return '\n'.join(lines)
 
+
+
+def category_month_forecast_text(path, store, source):
+    """Next calendar month forecast based on completed months and prior-year seasonality."""
+    today=datetime.now(REPORT_TZ).date()
+    if today.month==12:
+        target_year,target_month=today.year+1,1
+    else:
+        target_year,target_month=today.year,today.month+1
+    # Only complete months are used; current month is excluded.
+    latest_complete=today.replace(day=1)-timedelta(days=1)
+    recent=[]
+    for i in range(3):
+        y=latest_complete.year
+        m=latest_complete.month-i
+        while m<=0:y-=1;m+=12
+        recent.append((y,m))
+    prior=[(y-1,m) for y,m in recent]
+    historical=(target_year-1,target_month)
+    conn=category_db()
+    try:
+        clauses=['1=1'];params=[]
+        if store:clauses.append('store=?');params.append(store)
+        if source!='all':clauses.append('source=?');params.append(source)
+        for field,value in zip(('category','subcategory','itemgroup'),path):
+            clauses.append(field+'=?');params.append(value)
+        field=('category','subcategory','itemgroup')[len(path)] if len(path)<3 else None
+        cols='year,month'+(','+field if field else '')+',SUM(amount)'
+        where=' AND '.join(clauses)
+        rows=conn.execute(f'SELECT {cols} FROM category_sales WHERE {where} GROUP BY '+
+                          ('year,month,'+field if field else 'year,month'),params).fetchall()
+        # Availability is based on all categories, not selected category.
+        available=set(conn.execute('SELECT DISTINCT year,month FROM category_sales').fetchall())
+    finally:conn.close()
+    heading=(f'📆 ПРОГНОЗ КАТЕГОРІЙ | {target_month:02d}.{target_year}\n'
+             f'🏬 {store or "Весь регіон"}\n'
+             f'📂 {" → ".join(path) or "Усі категорії"}\n'
+             f'Джерело: {source}\n')
+    needed=[historical,*recent,*prior]
+    missing=[f'{m:02d}.{y}' for y,m in needed if (y,m) not in available]
+    if missing:
+        return heading+'\n⚠️ Для сезонного прогнозу бракує місячних даних: '+', '.join(dict.fromkeys(missing))+'. Онови Google Sheets через /catsync.'
+    series=defaultdict(dict)
+    for y,m,*tail in rows:
+        if field:name,amount=tail
+        else:name='Вибрана категорія';amount=tail[0]
+        series[name][(int(y),int(m))]=float(amount)
+    estimates=[]
+    for name,values in series.items():
+        base=sum(values.get(k,0) for k in prior)/3
+        recent_avg=sum(values.get(k,0) for k in recent)/3
+        seasonal=values.get(historical,0)
+        if base<100 or recent_avg<100:continue
+        raw_factor=seasonal/base
+        used_factor=max(.5,min(1.75,raw_factor))
+        estimate=recent_avg*used_factor
+        estimates.append((name,estimate,recent_avg,seasonal,raw_factor,used_factor))
+    heading+=('\nМетод: середній оборот 3 останніх завершених місяців × сезонний індекс '
+              'відповідного місяця минулого року. Для розрахунку індекс обмежено 0,50–1,75×. '
+              'Це орієнтир, не план і не гарантія.\n'
+              f'Останній завершений місяць: {latest_complete:%m.%Y}.\n')
+    if not estimates:return heading+'\nНедостатньо історії продажів для надійного розрахунку.'
+    total=sum(row[1] for row in estimates)
+    lines=[heading, f'\nОрієнтовний оборот груп із достатньою історією (не весь оборот): {fmt(total)}']
+    if field:
+        lines.append('\n📂 Категорії з найбільшим прогнозованим оборотом:')
+        for name,estimate,last,seasonal,raw,used in sorted(estimates,key=lambda x:x[1],reverse=True)[:10]:
+            icon='↗️' if used>1.05 else '↘️' if used<.95 else '➡️'
+            lines.append(f'{icon} {name}: {fmt(estimate)} (аналогічний місяць торік: {fmt(seasonal)}; індекс {raw:.2f}×, застосовано {used:.2f}×)')
+        rising=sorted((row for row in estimates if row[5]>1.1),key=lambda row:row[1],reverse=True)[:3]
+        if rising:lines.append('\n🎯 Підготовка: перевірити залишки, комплекти та готовність продавців у категоріях: '+', '.join(row[0] for row in rising)+'.')
+    else:
+        lines.append('\n🎯 Підготовка: перевірити залишки ходових товарів, комплекти та презентацію супутніх послуг.')
+    lines.append('\n⚠️ Прогноз не враховує акції, майбутні поставки, залишки та ціни. Поточний неповний місяць не використовується.')
+    return '\n'.join(lines)
+
 async def forecast_cmd(update,context):
     if not is_owner(update):return
     if update.effective_chat.type!='private':return
@@ -3412,7 +3489,7 @@ async def forecast_cmd(update,context):
     if not state:
         await update.effective_message.reply_text('Спочатку вибери магазин і категорію через /categories, потім натисни 🔮 Прогноз.')
         return
-    report=await asyncio.to_thread(category_forecast_text,state['path'],state['store'],state['source'])
+    report=await asyncio.to_thread(category_month_forecast_text if context.args and context.args[0].lower() in ('month','місяць') else category_forecast_text,state['path'],state['store'],state['source'])
     for i in range(0,len(report),3500):
         await update.effective_message.reply_text(report[i:i+3500])
 
