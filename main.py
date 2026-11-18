@@ -3217,6 +3217,119 @@ async def category_upload(update,context):
         await update.effective_message.reply_text(f'❌ Помилка імпорту категорій: {e}')
 
 
+
+# Google Sheets — live quarterly category workbook.
+CATEGORY_SHEET_ID = "1an0FtCE00ttIJEh5LI0KKIMpEXlP6GIikAMJmQdo-58"
+
+def fetch_category_google_xlsx():
+    """Fetch the original Google workbook as XLSX, preserving pivot indentation/styles."""
+    import requests
+    url = f"https://docs.google.com/spreadsheets/d/{CATEGORY_SHEET_ID}/export"
+    errors = []
+    # The user enabled link-reader access. No extra API key required.
+    try:
+        response = requests.get(url, params={"format": "xlsx"}, timeout=120,
+                                headers={"User-Agent": "Mozilla/5.0"})
+        response.raise_for_status()
+        if response.content[:2] == b"PK" and zipfile.is_zipfile(io.BytesIO(response.content)):
+            return response.content
+        errors.append("публічне посилання повернуло не Excel")
+    except Exception as exc:
+        errors.append(f"публічний експорт: {exc}")
+
+    # Private fallback for an existing service account (requires Drive API access).
+    config = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if config:
+        try:
+            from google.oauth2.service_account import Credentials
+            from google.auth.transport.requests import AuthorizedSession
+            credentials = Credentials.from_service_account_info(
+                json.loads(config),
+                scopes=["https://www.googleapis.com/auth/drive.readonly"])
+            with AuthorizedSession(credentials) as session:
+                response = session.get(
+                    f"https://www.googleapis.com/drive/v3/files/{CATEGORY_SHEET_ID}/export",
+                    params={"mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+                    timeout=120)
+                response.raise_for_status()
+                if zipfile.is_zipfile(io.BytesIO(response.content)):
+                    return response.content
+                errors.append("Google Drive повернув не Excel")
+        except Exception as exc:
+            errors.append(f"авторизований експорт: {exc}")
+    raise ValueError("Не вдалося отримати таблицю категорій. " + "; ".join(errors))
+
+def category_sync_state(conn):
+    conn.execute("""CREATE TABLE IF NOT EXISTS category_sync_state
+        (id INTEGER PRIMARY KEY CHECK(id=1), signature TEXT NOT NULL,
+         updated_at TEXT NOT NULL, rows INTEGER NOT NULL)""")
+
+def sync_categories_google():
+    import hashlib
+    raw = fetch_category_google_xlsx()
+    digest = hashlib.sha256(raw).hexdigest()
+    conn = category_db()
+    try:
+        category_sync_state(conn)
+        previous = conn.execute("SELECT signature,rows FROM category_sync_state WHERE id=1").fetchone()
+        populated = conn.execute("SELECT EXISTS(SELECT 1 FROM category_sales LIMIT 1)").fetchone()[0]
+        if previous and previous[0] == digest and populated:
+            return False, previous[1]
+    finally:
+        conn.close()
+    # Parse fully before replacing the previous successful snapshot.
+    parsed = parse_category_workbook(raw)
+    conn = category_db()
+    try:
+        with conn:
+            category_sync_state(conn)
+            conn.execute("DELETE FROM category_sales")
+            conn.executemany("INSERT INTO category_sales VALUES (?,?,?,?,?,?,?,?,?)",
+                             [(*key, round(value,4)) for key,value in parsed.items()])
+            conn.execute("""INSERT OR REPLACE INTO category_sync_state
+                (id,signature,updated_at,rows) VALUES (1,?,?,?)""",
+                         (digest,datetime.now(ZoneInfo("Europe/Kyiv")).isoformat(),len(parsed)))
+    finally:
+        conn.close()
+    return True, len(parsed)
+
+async def categories_sync_cmd(update,context):
+    if not is_owner(update):
+        return
+    if update.effective_chat.type != "private":
+        await update.effective_message.reply_text("Оновлення категорій доступне в особистому чаті.")
+        return
+    await update.effective_message.reply_text("🔄 Зчитую квартали безпосередньо з Google Sheets…")
+    try:
+        changed,count = await asyncio.to_thread(sync_categories_google)
+        message = (f"✅ Категорії оновлено: {count:,} записів. Відкрий /categories."
+                   if changed else f"✅ Дані актуальні: {count:,} записів, змін у Google Sheets немає.")
+        await update.effective_message.reply_text(message.replace(","," "))
+    except Exception as exc:
+        log.exception("Google categories sync failed")
+        await update.effective_message.reply_text(
+            f"❌ Не вдалося оновити категорії: {str(exc)[:600]}\n"
+            "Попередні успішно збережені дані не видалено.")
+
+async def categories_auto_loop(app):
+    """Poll quarterly workbook every four hours, independently of existing report jobs."""
+    await asyncio.sleep(90)
+    while True:
+        try:
+            changed,count = await asyncio.to_thread(sync_categories_google)
+            if changed:
+                log.info("Category workbook updated: %s rows",count)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Automatic Google category refresh failed; retaining old data")
+        await asyncio.sleep(4*60*60)
+
+_old_setup_group_schedule = setup_group_schedule
+async def setup_group_schedule(app):
+    await _old_setup_group_schedule(app)
+    app.create_task(categories_auto_loop(app),name="categories-google-refresh")
+
 def main():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN environment variable is missing")
@@ -3229,6 +3342,7 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
     )
+    app.add_handler(CommandHandler("catsync", categories_sync_cmd, block=False))
     app.add_handler(CommandHandler("categories", categories_cmd))
     app.add_handler(CallbackQueryHandler(categories_callback, pattern=r"^cat:(store|source|cat|page|back|report|period):"))
     app.add_handler(CommandHandler("wow", wow_menu))
