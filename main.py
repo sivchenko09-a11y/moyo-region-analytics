@@ -1963,6 +1963,9 @@ def digest_dashboard(day):
         y=690+i*54
         if i%2==0: rect(30,y,1670,y+52,'#eef5fd',5)
         txt(43,y+13,short.get(store,store),21,navy,True)
+        if show_missing and store not in data:
+            txt(760,y+13,"НЕМАЄ ДАНИХ",22,"#b63f62",True)
+            continue
         for k,xp,xf,xe,xs in (('sales',380,500,556,None),
                                ('accessories',786,905,973,1160),
                                ('services',1280,1390,1458,1650)):
@@ -1991,7 +1994,7 @@ def digest_dashboard(day):
     txt(50,1551,'↑ ТОП-3  •  ОБОРОТ',29,'#07854e',True)
     txt(885,1551,'↓ АНТИТОП-3  •  ОБОРОТ',29,'#c82e43',True)
     ranking=[(store,perf(vals['sales'],plan['sales']),vals['sales']) for store,vals,plan in results]
-    ranking=[v for v in ranking if v[1] is not None]
+    ranking=[v for v in ranking if v[1] is not None and (not show_missing or v[0] in data)]
     ranking.sort(key=lambda z:z[1],reverse=True)
     for x,group in ((50,ranking[:3]),(870,list(reversed(ranking[-3:])))):
         for i,(store,pc,actual) in enumerate(group):
@@ -2326,7 +2329,7 @@ def _interim_number(value):
     except (ValueError, TypeError):
         raise ValueError(f'Некоректна сума в 1С: {value!r}')
 
-def parse_interim_rows(rows, report_day):
+def parse_interim_rows(rows, report_day, allow_partial=False):
     """Read ONLY store subtotals; receipt/date rows are deliberately ignored."""
     import hashlib
     header_text = '\n'.join(str(c) for row in rows[:8] for c in row)
@@ -2352,7 +2355,9 @@ def parse_interim_rows(rows, report_day):
         data[name] = {'sales': _interim_number(row[1] if len(row)>1 else None),
                       'accessories': _interim_number(row[2] if len(row)>2 else None),
                       'services': _interim_number(row[3] if len(row)>3 else None)}
-    if set(data) != set(STORE_ORDER):
+    if not data:
+        raise ValueError("У вкладці 1С поки немає даних жодного магазину.")
+    if not allow_partial and set(data) != set(STORE_ORDER):
         missing = sorted(set(STORE_ORDER) - set(data))
         raise ValueError('Неповні дані 1С: відсутні магазини: ' + ', '.join(missing))
     # Hash of meaningful source values, independent of receipt count and cell formatting.
@@ -2360,7 +2365,7 @@ def parse_interim_rows(rows, report_day):
     signature = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
     return rate, data, signature
 
-def fetch_interim_sheet(report_day):
+def fetch_interim_sheet(report_day, allow_partial=False):
     from google.oauth2.service_account import Credentials
     from google.auth.transport.requests import AuthorizedSession
     from urllib.parse import quote
@@ -2379,9 +2384,9 @@ def fetch_interim_sheet(report_day):
         response = session.get(f'https://sheets.googleapis.com/v4/spreadsheets/{INTERIM_SHEET_ID}/values/{address}',
                                params={'valueRenderOption':'FORMATTED_VALUE'},timeout=45)
         response.raise_for_status()
-        return parse_interim_rows(response.json().get('values', []), report_day)
+        return parse_interim_rows(response.json().get('values', []), report_day, allow_partial=allow_partial)
 
-def interim_dashboard(report_day, slot, rate, data, detected_at=None):
+def interim_dashboard(report_day, slot, rate, data, detected_at=None, show_missing=False):
     """Render the approved dense MOYO dashboard: grouped plan/fact/%/share columns."""
     from PIL import Image, ImageDraw, ImageFont
     from matplotlib import font_manager
@@ -2419,7 +2424,7 @@ def interim_dashboard(report_day, slot, rate, data, detected_at=None):
     navy='#10355e'; muted='#52677f'
     rect(14,14,W-14,145,navy,24)
     txt(40,27,'MOYO  |  ПРОМІЖКОВИЙ ЗВІТ',46,'white',True)
-    txt(42,91,'РЕГІОН — ЦЕНТР    •    ДЕНЬ В ДЕНЬ',23,'#c7e1fa')
+    txt(42,91,('РЕГІОН — ЦЕНТР    •    НЕПОВНІ ДАНІ' if show_missing and len(data)<len(STORE_ORDER) else 'РЕГІОН — ЦЕНТР    •    ДЕНЬ В ДЕНЬ'),23,'#c7e1fa')
     txt(W-36,33,report_day.strftime('%d.%m.%Y'),29,'white',True,'ra')
     txt(W-36,80,f'Дані виявлено: {(detected_at or datetime.now(REPORT_TZ)):%H:%M}   |   Курс {rate:g} грн/$',21,'#dcecff',True,'ra')
     cards=[('ОБОРОТ','sales','#216dc4'),('АКСЕСУАРИ','accessories','#0e9962'),('ПОСЛУГИ','services','#b63f62')]
@@ -2446,7 +2451,7 @@ def interim_dashboard(report_day, slot, rate, data, detected_at=None):
             share=100*totals[k]/totals['sales'] if totals['sales'] else 0
             txt(x+cw-22,468,f'Частка в обороті: {share:.2f}%',19,navy,True,'ra')
     rect(14,511,W-14,1505,'white',20)
-    txt(36,526,'МАГАЗИНИ — ВИКОНАННЯ ПЛАНУ',34,navy,True)
+    txt(36,526,('МАГАЗИНИ — ДАНІ '+str(len(data))+'/'+str(len(STORE_ORDER)) if show_missing else 'МАГАЗИНИ — ВИКОНАННЯ ПЛАНУ'),34,navy,True)
     # Widths: store 248; turnover 405; accessories 505; services 505
     x0=30; boundaries=[x0,280,680,1182,1670]
     rect(30,587,1670,687,navy,12)
@@ -2462,6 +2467,9 @@ def interim_dashboard(report_day, slot, rate, data, detected_at=None):
         y=690+i*rowh
         if i%2==0: rect(30,y,1670,y+rowh-2,'#eef5fd',5)
         txt(43,y+13,short.get(store,store),21,navy,True)
+        if show_missing and store not in data:
+            txt(760,y+13,"НЕМАЄ ДАНИХ",22,"#b63f62",True)
+            continue
         for k,xp,xf,xe,xs in (('sales',380,500,556,None),('accessories',786,905,973,1160),('services',1280,1390,1458,1650)):
             pp=perf(vals[k],plan[k]); share=100*vals[k]/vals['sales'] if vals['sales'] else 0
             txt(xp,y+14,money(plan[k]) if plan[k] is not None else '—',19,muted,False,'ra')
@@ -2486,7 +2494,7 @@ def interim_dashboard(report_day, slot, rate, data, detected_at=None):
     txt(94,1551,'ТОП-3  •  ОБОРОТ',29,'#07854e',True)
     txt(885,1551,'↓ АНТИТОП-3  •  ОБОРОТ',29,'#c82e43',True)
     ranking=[(store,perf(vals['sales'],plan['sales']),vals['sales']) for store,vals,plan in results]
-    ranking=[v for v in ranking if v[1] is not None]
+    ranking=[v for v in ranking if v[1] is not None and (not show_missing or v[0] in data)]
     ranking.sort(key=lambda z:z[1],reverse=True)
     if not ranking:
         txt(55,1650,'Плани ще не завантажені',22,muted)
@@ -2592,7 +2600,7 @@ async def interim_loop(app):
         day_key = day.isoformat()
         chat_key = str(GROUP_CHAT_ID)
         try:
-            rate, data, signature = await asyncio.to_thread(fetch_interim_sheet, day)
+            rate, data, signature = await asyncio.to_thread(fetch_interim_sheet, day, True)
             conn = interim_watch_db()
             try:
                 saved = conn.execute(
@@ -2618,14 +2626,17 @@ async def interim_loop(app):
                 continue  # Require two consecutive identical snapshots.
             detected_at = pending[1]
             await asyncio.to_thread(refresh_interim_plans, day)
-            picture = await asyncio.to_thread(interim_dashboard, day, now.hour, rate, data, detected_at)
+            picture = await asyncio.to_thread(interim_dashboard, day, now.hour, rate, data, detected_at, True)
             sent_at = datetime.now(REPORT_TZ)
             await app.bot.send_photo(
                 chat_id=int(GROUP_CHAT_ID), photo=picture,
                 caption=(f'📊 МОЙО ЦЕНТР | ПРОМІЖКОВИЙ ЗВІТ 1С\n'
                          f'📅 Дата: {day:%d.%m.%Y}\n'
                          f'🕒 Нові дані виявлено: {detected_at:%H:%M} (Київ)\n'
-                         f'📤 Відправлено: {sent_at:%H:%M} (Київ)'))
+                         f'📤 Відправлено: {sent_at:%H:%M} (Київ)\n'
+                         f'🏬 Дані є: {len(data)}/{len(STORE_ORDER)} магазинів'
+                         + ('\n⚠️ Регіональний факт неповний: відсутні магазини позначені на зображенні.'
+                            if len(data) < len(STORE_ORDER) else '')))
             conn = interim_watch_db()
             try:
                 with conn:
@@ -2660,12 +2671,12 @@ async def private_test_menu(update, context):
     )
 
 
-def fetch_interim_sheet_with_retry(report_day):
+def fetch_interim_sheet_with_retry(report_day, allow_partial=False):
     """Retry transient Sheets quota errors without touching the group schedule."""
     import time
     for attempt in range(4):
         try:
-            return fetch_interim_sheet(report_day)
+            return fetch_interim_sheet(report_day, allow_partial=allow_partial)
         except Exception as exc:
             if '429' not in str(exc) or attempt == 3:
                 raise
@@ -2701,13 +2712,14 @@ async def private_test_selected(update, context):
             caption = f"🧪 ТЕСТ • МОЙО — місячний тренд станом на {yesterday:%d.%m.%Y}"
         else:
             # Reuse stored monthly plans; do not refresh all Google Sheets for a preview.
-            rate, data, _ = await asyncio.to_thread(fetch_interim_sheet_with_retry, today)
+            rate, data, _ = await asyncio.to_thread(fetch_interim_sheet_with_retry, today, True)
             hour = datetime.now(REPORT_TZ).hour
             slot = 21 if hour >= 21 else 18 if hour >= 18 else 15
-            picture = await asyncio.to_thread(interim_dashboard, today, slot, rate, data)
+            picture = await asyncio.to_thread(interim_dashboard, today, slot, rate, data, None, True)
             caption = (f"🧪 ТЕСТ • МОЙО — проміжковий звіт 1С ({today:%d.%m.%Y})\\n"
                        f"🕒 Перевірено: {datetime.now(REPORT_TZ):%H:%M} (Київ)\\n"
-                       f"Курс: {rate:g} грн/$")
+                       f"Курс: {rate:g} грн/$\n"
+                       f"🏬 Дані є: {len(data)}/{len(STORE_ORDER)} магазинів. Відсутні позначені на зображенні.")
         await context.bot.send_photo(chat_id=chat_id, photo=picture, caption=caption)
     except Exception as exc:
         if "429" in str(exc):
