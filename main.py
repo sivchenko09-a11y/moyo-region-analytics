@@ -3078,6 +3078,8 @@ def import_categories(raw):
     return len(parsed),len(set(k[0:3] for k in parsed)),len(set(k[3] for k in parsed))
 
 def category_options(prefix,store,source,year=None,month=None,week=None):
+    if len(prefix) >= 4:
+        return []
     conn=category_db()
     try:
         clauses=['1=1'];params=[]
@@ -3111,14 +3113,14 @@ def category_child_comparison(prefix, store, source, period, previous, current):
     """Break down the selected category by its immediate child, not by subtotals."""
     if len(prefix) >= 4:
         return []
-    field = ('category', 'subcategory', 'itemgroup')[len(prefix)]
+    field = ('category', 'subcategory', 'itemgroup', 'brand')[len(prefix)]
     clauses = [f"{field} <> ''"]
     params = []
     if store:
         clauses.append('store=?'); params.append(store)
     if source != 'all':
         clauses.append('source=?'); params.append(source)
-    for col, val in zip(('category', 'subcategory', 'itemgroup'), prefix):
+    for col, val in zip(('category', 'subcategory', 'itemgroup', 'brand'), prefix):
         clauses.append(f'{col}=?'); params.append(val)
     if period == 'week':
         period_clause = 'year=? AND week=?'
