@@ -2647,13 +2647,8 @@ async def interim_loop(app):
             sent_at = datetime.now(REPORT_TZ)
             await app.bot.send_photo(
                 chat_id=int(GROUP_CHAT_ID), photo=picture,
-                caption=(f'📊 МОЙО ЦЕНТР | ПРОМІЖКОВИЙ ЗВІТ 1С\n'
-                         f'📅 Дата: {day:%d.%m.%Y}\n'
-                         f'🕒 Нові дані виявлено: {detected_at:%H:%M} (Київ)\n'
-                         f'📤 Відправлено: {sent_at:%H:%M} (Київ)\n'
-                         f'🏬 Дані є: {len(data)}/{len(STORE_ORDER)} магазинів'
-                         + ('\n⚠️ Регіональний факт неповний: відсутні магазини позначені на зображенні.'
-                            if len(data) < len(STORE_ORDER) else '')))
+                caption=(f'📊 МОЙО ЦЕНТР | ПРОМІЖКОВИЙ ЗВІТ\n'
+                         f'🕒 Актуально на {detected_at:%H:%M}'))
             conn = interim_watch_db()
             try:
                 with conn:
