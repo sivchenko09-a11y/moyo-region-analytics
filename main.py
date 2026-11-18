@@ -2510,7 +2510,14 @@ def interim_dashboard(report_day, slot, rate, data, detected_at=None, show_missi
         txt(55,1650,'Плани ще не завантажені',22,muted)
         txt(885,1650,'Плани ще не завантажені',22,muted)
     else:
-        for x,group in ((50,ranking[:3]),(870,list(reversed(ranking[-3:])))):
+        # For partial 1C data, avoid overlapping best/worst store rankings.
+        # Six reporting stores are required for two distinct sets of three.
+        groups = [(50, ranking[:3])]
+        if len(ranking) >= 6:
+            groups.append((870, list(reversed(ranking[-3:]))))
+        else:
+            txt(885,1650,'Недостатньо даних для рейтингу',22,muted)
+        for x,group in groups:
             for i,(store,pc,actual) in enumerate(group):
                 y=1620+i*60
                 txt(x,y,f'{i+1}. {short.get(store,store)}',20,navy,True)
