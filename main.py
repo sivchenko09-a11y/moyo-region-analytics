@@ -1,3 +1,4 @@
+import html
 import os
 import math
 import asyncio
@@ -1682,14 +1683,15 @@ def direct_week_comparison(as_of=None):
         f'Однакові дні: {n} (без сьогодні)', '',
         f'Минулий тиждень: {money(old_total)} $',
         f'Поточний тиждень: {money(new_total)} $',
-        f'Різниця: {sign(delta)}{money(delta)} $ ({change_str(change)})',
+        f'Різниця: {"🟢" if delta>0 else "🔴" if delta<0 else "⚪"} <b>{sign(delta)}{money(delta)} $ ({change_str(change)})</b>',
         '', '🏬 ПО МАГАЗИНАХ (мин. → поточн. | Δ $ | Δ %)'
     ]
     for store in STORE_ORDER:
         a=float(old.loc[store]); b=float(new.loc[store]); diff=b-a
         percent=(diff/a*100) if a else None
         label=store.replace('Київ-','')
-        lines.append(f'{label}: {money(a)} → {money(b)} $ | {sign(diff)}{money(diff)} $ | {change_str(percent)}')
+        indicator = '🟢' if diff > 0 else '🔴' if diff < 0 else '⚪'
+        lines.append(f'{indicator} {html.escape(label)}: {money(a)} → {money(b)} $ | <b>{sign(diff)}{money(diff)} $ | {change_str(percent)}</b>')
     return '\n'.join(lines)
 
 
@@ -1701,7 +1703,7 @@ async def direct_wow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         report=await asyncio.to_thread(direct_week_comparison)
-        await update.effective_message.reply_text(report)
+        await update.effective_message.reply_text(report, parse_mode='HTML')
     except Exception as exc:
         log.exception('Direct WoW report failed')
         await update.effective_message.reply_text(f'❌ Не вдалося сформувати порівняння прямих: {exc}')
