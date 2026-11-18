@@ -1825,6 +1825,7 @@ async def setup_commands(app):
     await app.bot.set_my_commands([
         BotCommand("focus", "🎯 Фокуси + категорії"),
         BotCommand("wow", "8 показників: тиждень до тижня"),
+        BotCommand("categories", "Категорії: ієрархія та порівняння"),
         BotCommand("direct_wow", "Вибір порівняння тиждень до тижня"),
         BotCommand("group_test", "Тест відправки у групу"),
         BotCommand("interim_test", "Тест проміжкового звіту 1С"),
@@ -1856,6 +1857,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data.pop("pending_file", None)
     caption = update.message.caption or ""
+    if filename.lower().endswith(".xlsx") and "категор" in caption.lower():
+        await category_upload(update, context)
+        return ConversationHandler.END
     match = re.search(r"(\d{2})[./-](\d{2})[./-](\d{4})", caption)
     if not match:
         context.user_data["pending_file"] = (doc.file_id, filename)
@@ -2940,6 +2944,279 @@ async def setup_group_schedule(app):
     app.create_task(interim_loop(app), name="interim-sales-watch-kyiv")
 
 
+# Category analytics extension: quarterly Power BI pivot import and navigation
+import zipfile
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+
+CATEGORY_SOURCES = {'Прямая продажа':'direct','Заказ магазина':'direct',
+                    'Заказ с сайта':'pickup','Заказ приложения':'pickup',
+                    'Заказ по телефону':'other','Заказ с чата':'other'}
+CAT_NS = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
+
+def category_db():
+    conn=sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute('''CREATE TABLE IF NOT EXISTS category_sales (
+       year INTEGER, month INTEGER, week INTEGER, store TEXT, category TEXT,
+       subcategory TEXT, itemgroup TEXT, source TEXT, amount REAL,
+       PRIMARY KEY(year,month,week,store,category,subcategory,itemgroup,source))''')
+    conn.commit()
+    return conn
+
+def _cat_amount(v):
+    try: return float(str(v).replace('\u00a0','').replace(' ','').replace(',','.'))
+    except (TypeError,ValueError): return None
+
+def _cat_column(ref):
+    letters=re.match(r'[A-Z]+',ref).group()
+    n=0
+    for c in letters:n=n*26+ord(c)-64
+    return n-1
+
+def parse_category_workbook(raw):
+    """Only leaf source rows are stored, never pivot subtotal rows."""
+    month_names={'январь':1,'февраль':2,'март':3,'апрель':4,'май':5,'июнь':6,
+                 'июль':7,'август':8,'сентябрь':9,'октябрь':10,'ноябрь':11,'декабрь':12}
+    results=defaultdict(float)
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        if 'xl/sharedStrings.xml' in z.namelist():
+            root=ET.fromstring(z.read('xl/sharedStrings.xml'))
+            strings=[''.join(t.text or '' for t in el.iter(CAT_NS+'t')) for el in root.findall(CAT_NS+'si')]
+        else:strings=[]
+        book=ET.fromstring(z.read('xl/workbook.xml'))
+        sheets=[s.attrib['name'] for s in book.iter(CAT_NS+'sheet')]
+        for idx,sheet in enumerate(sheets,1):
+            match=re.search(r'Квартал\s*([1-4])\s*(20\d\d)',sheet,re.I)
+            if not match:continue
+            quarter,year=map(int,match.groups())
+            filename=f'xl/worksheets/sheet{idx}.xml'
+            if filename not in z.namelist():raise ValueError(f'Немає даних вкладки {sheet}')
+            month_by_col={};week_by_col={}
+            store=category=subcategory=itemgroup=None
+            def cell_data(c):
+                v=c.find(CAT_NS+'v')
+                if v is not None:
+                    return strings[int(v.text)] if c.get('t')=='s' else v.text
+                inline=c.find(CAT_NS+'is')
+                return ''.join(inline.itertext()) if inline is not None else None
+            with z.open(filename) as stream:
+                for _,row in ET.iterparse(stream,events=('end',)):
+                    if row.tag!=CAT_NS+'row':continue
+                    rn=int(row.attrib['r']);cells={_cat_column(c.attrib['r']):(cell_data(c),c.attrib.get('s')) for c in row.findall(CAT_NS+'c')}
+                    if rn==3:
+                        current=None
+                        for col in sorted(cells):
+                            label=str(cells[col][0] or '').strip().lower()
+                            if label in month_names:current=month_names[label]
+                            if col>0 and current:month_by_col[col]=current
+                    elif rn==4:
+                        for col,(v,_) in cells.items():
+                            m=re.search(r'Неделя\s*(\d+)',str(v or ''),re.I)
+                            if m and col in month_by_col:week_by_col[col]=int(m.group(1))
+                    elif rn>4:
+                        label=str(cells.get(0,('',None))[0] or '').strip()
+                        if not label:row.clear();continue
+                        if label in STORE_ORDER or ('Київ-'+label) in STORE_ORDER:
+                            store=label if label in STORE_ORDER else 'Київ-'+label
+                            category=subcategory=itemgroup=None
+                        elif re.match(r'^\d{2}\.\s',label):
+                            category=label;subcategory=itemgroup=None
+                        elif label in CATEGORY_SOURCES:
+                            if store and category and (itemgroup or subcategory):
+                                source=CATEGORY_SOURCES[label]
+                                for col,(v,_) in cells.items():
+                                    if col not in week_by_col or col not in month_by_col:continue
+                                    value=_cat_amount(v)
+                                    if value is None:continue
+                                    key=(year,month_by_col[col],week_by_col[col],store,category,subcategory or '',itemgroup or '',source)
+                                    results[key]+=value
+                        elif store and category:
+                            style=cells.get(0,('',None))[1]
+                            # Pivot export: subcategory headings use style 18;
+                            # product groups use style 16 (as do top categories).
+                            if style=='18':subcategory=label;itemgroup=None
+                            elif style=='16':itemgroup=label
+                            else:
+                                # Never silently assign an ambiguous subtotal as a product group.
+                                pass
+                    row.clear()
+    if not results:raise ValueError('Не знайдено продажів за джерелами замовлень у квартальних вкладках.')
+    return results
+
+def import_categories(raw):
+    parsed=parse_category_workbook(raw)
+    conn=category_db()
+    try:
+        with conn:
+            # Full snapshot: updated quarter replaces old figures, not added to them.
+            conn.execute('DELETE FROM category_sales')
+            conn.executemany('INSERT INTO category_sales VALUES (?,?,?,?,?,?,?,?,?)',
+                             [(*k,round(v,4)) for k,v in parsed.items()])
+    finally:conn.close()
+    return len(parsed),len(set(k[0:3] for k in parsed)),len(set(k[3] for k in parsed))
+
+def category_options(prefix,store,source,year=None,month=None,week=None):
+    conn=category_db()
+    try:
+        clauses=['1=1'];params=[]
+        if store:clauses.append('store=?');params.append(store)
+        if source!='all':clauses.append('source=?');params.append(source)
+        for col,val in zip(('category','subcategory','itemgroup'),prefix):
+            clauses.append(col+'=?');params.append(val)
+        field=('category','subcategory','itemgroup')[len(prefix)]
+        if year:clauses.append('year=?');params.append(year)
+        if month:clauses.append('month=?');params.append(month)
+        if week:clauses.append('week=?');params.append(week)
+        return [r[0] for r in conn.execute(f'SELECT DISTINCT {field} FROM category_sales WHERE '+ ' AND '.join(clauses)+f' AND {field}<>\'\' ORDER BY {field}',params)]
+    finally:conn.close()
+
+def category_amount(prefix,store,source,period,period_id):
+    conn=category_db()
+    try:
+        clauses=[];params=[]
+        if store:clauses.append('store=?');params.append(store)
+        if source!='all':clauses.append('source=?');params.append(source)
+        for col,val in zip(('category','subcategory','itemgroup'),prefix):clauses.append(col+'=?');params.append(val)
+        if period=='week':
+            clauses+=['year=?','week=?'];params.extend(period_id)
+        else:
+            clauses+=['year=?','month=?'];params.extend(period_id)
+        sql='SELECT COALESCE(SUM(amount),0) FROM category_sales WHERE '+' AND '.join(clauses)
+        return float(conn.execute(sql,params).fetchone()[0])
+    finally:conn.close()
+
+def category_periods(period):
+    conn=category_db()
+    try:
+        if period=='week':return conn.execute('SELECT DISTINCT year,week FROM category_sales ORDER BY year DESC,week DESC').fetchall()
+        return conn.execute('SELECT DISTINCT year,month FROM category_sales ORDER BY year DESC,month DESC').fetchall()
+    finally:conn.close()
+
+def cat_keyboard(options,kind='cat',page=0):
+    start=page*8
+    buttons=[[InlineKeyboardButton(o[:52],callback_data=f'cat:{kind}:{i+start}')] for i,o in enumerate(options[start:start+8])]
+    controls=[]
+    if page>0:controls.append(InlineKeyboardButton('◀️',callback_data=f'cat:page:{page-1}'))
+    if start+8<len(options):controls.append(InlineKeyboardButton('▶️',callback_data=f'cat:page:{page+1}'))
+    if controls:buttons.append(controls)
+    buttons.append([InlineKeyboardButton('📊 Аналіз цього рівня',callback_data='cat:report:0')])
+    buttons.append([InlineKeyboardButton('⬅️ Назад',callback_data='cat:back:0')])
+    return InlineKeyboardMarkup(buttons)
+
+async def categories_cmd(update,context):
+    if not is_owner(update):return
+    if update.effective_chat.type!='private':
+        await update.effective_message.reply_text('Категорії доступні лише в особистому чаті.')
+        return
+    context.user_data['cat']={'store':None,'source':'all','path':[],'step':'store','page':0}
+    await update.effective_message.reply_text('📊 КАТЕГОРІЇ\nОберіть магазин:',reply_markup=InlineKeyboardMarkup(
+        [[InlineKeyboardButton('🌍 Весь регіон',callback_data='cat:store:all')]]+
+        [[InlineKeyboardButton(s.replace('Київ-',''),callback_data=f'cat:store:{i}')] for i,s in enumerate(STORE_ORDER)]))
+
+async def categories_callback(update,context):
+    q=update.callback_query
+    if not is_owner(update):await q.answer('Немає доступу');return
+    await q.answer()
+    state=context.user_data.get('cat')
+    if not state:await q.message.reply_text('Почни з /categories');return
+    _,kind,value=q.data.split(':',2)
+    if kind=='store':
+        state['store']=None if value=='all' else STORE_ORDER[int(value)]
+        state['step']='source'
+        await q.edit_message_text('Оберіть джерело продажів:',reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton('💰 Усі джерела',callback_data='cat:source:all')],
+            [InlineKeyboardButton('💵 Прямі',callback_data='cat:source:direct')],
+            [InlineKeyboardButton('📦 Пікап',callback_data='cat:source:pickup')],
+            [InlineKeyboardButton('☎️ Інші джерела',callback_data='cat:source:other')],
+            [InlineKeyboardButton('⬅️ Назад',callback_data='cat:back:0')]]))
+        return
+    if kind=='source':
+        state['source']=value;state['step']='browse';state['page']=0
+    elif kind=='back':
+        if state['step']=='period':
+            state['step']='browse'
+        if state['step']=='browse':
+            if state['path']:state['path'].pop()
+            else:
+                state['step']='source'
+                await q.edit_message_text('Оберіть джерело:',reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(x,callback_data='cat:source:'+v)] for x,v in
+                    [('Усі','all'),('Прямі','direct'),('Пікап','pickup'),('Інші','other')]]))
+                return
+        else:
+            state['step']='store'
+            await q.edit_message_text('Оберіть магазин:',reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton('🌍 Весь регіон',callback_data='cat:store:all')]]+
+                [[InlineKeyboardButton(n.replace('Київ-',''),callback_data=f'cat:store:{i}')] for i,n in enumerate(STORE_ORDER)]))
+            return
+    elif kind=='page':state['page']=int(value)
+    elif kind=='cat':
+        options=category_options(state['path'],state['store'],state['source'])
+        i=int(value)
+        if i>=len(options):await q.message.reply_text('Список оновився. Відкрий /categories знову.');return
+        state['path'].append(options[i]);state['page']=0
+    elif kind=='report':
+        state['step']='period'
+        await q.edit_message_text('📊 '+(' → '.join(state['path']) or 'Усі категорії')+'\nОберіть порівняння:',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton('📅 Тиждень до тижня',callback_data='cat:period:week')],
+                [InlineKeyboardButton('🗓 Місяць до місяця',callback_data='cat:period:month')],
+                [InlineKeyboardButton('📆 Рік до року',callback_data='cat:period:year')],
+                [InlineKeyboardButton('⬅️ Назад',callback_data='cat:period:back')]]))
+        return
+    elif kind=='period':
+        if value=='back':state['step']='browse'
+        else:
+            mode=value
+            periods=category_periods('week' if mode=='week' else 'month')
+            today=datetime.now(REPORT_TZ).date()
+            if mode=='week':
+                y,w,_=today.isocalendar()
+                periods=[p for p in periods if p<(y,w)]
+            else:
+                periods=[p for p in periods if p<(today.year,today.month)]
+            if not periods:await q.message.reply_text('Спочатку завантаж файл категорій.');return
+            newest=periods[0]
+            if mode=='year':
+                prev=(newest[0]-1,newest[1])
+            else:
+                prev=periods[1] if len(periods)>1 else None
+            if not prev or prev not in periods:
+                await q.message.reply_text('Немає попереднього періоду для порівняння.');return
+            a=category_amount(state['path'],state['store'],state['source'],'week' if mode=='week' else 'month',prev)
+            b=category_amount(state['path'],state['store'],state['source'],'week' if mode=='week' else 'month',newest)
+            d=b-a
+            marker='🟢' if d>0 else '🔴' if d<0 else '⚪'
+            pct=f'{d/a*100:+.1f}%' if a else '— (нульова база)'
+            fmt=lambda n:f'{n:,.0f}'.replace(',',' ')
+            await q.message.reply_text(
+                f'📊 КАТЕГОРІЇ | {"ТИЖДЕНЬ" if mode=="week" else "МІСЯЦЬ" if mode=="month" else "РІК"} ДО {"ТИЖНЯ" if mode=="week" else "МІСЯЦЯ" if mode=="month" else "РОКУ"}\n'
+                f'🏬 {html.escape(state["store"] or "Весь регіон")}\n'
+                f'📁 {html.escape(" → ".join(state["path"]) or "Усі категорії")}\n'
+                f'Джерело: {state["source"]}\n'
+                f'{prev[0]} / {prev[1]}: {fmt(a)} $\n'
+                f'{newest[0]} / {newest[1]}: {fmt(b)} $\n'
+                f'{marker} <b>{d:+,.0f} $ ({pct})</b>'.replace(',', ' '),parse_mode='HTML')
+            return
+    if state['step']=='browse':
+        options=category_options(state['path'],state['store'],state['source']) if len(state['path'])<3 else []
+        await q.edit_message_text('📂 '+(' → '.join(state['path']) or 'Усі категорії')+'\nОберіть підкатегорію або аналіз:',
+                                  reply_markup=cat_keyboard(options,page=state['page']))
+
+async def category_upload(update,context):
+    if not is_owner(update):return
+    if update.effective_chat.type!='private':return
+    await update.effective_message.reply_text('⏳ Завантажую квартали. Це може тривати до хвилини…')
+    try:
+        f=await context.bot.get_file(update.message.document.file_id)
+        out=io.BytesIO();await f.download_to_memory(out=out)
+        count,periods,stores=await asyncio.to_thread(import_categories,out.getvalue())
+        await update.effective_message.reply_text(f'✅ Категорії оновлено: {count:,} комбінацій, {periods} тижнів у межах місяців, {stores} магазинів. Відкрий /categories.'.replace(',',' '))
+    except Exception as e:
+        log.exception('Category import failed')
+        await update.effective_message.reply_text(f'❌ Помилка імпорту категорій: {e}')
+
+
 def main():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN environment variable is missing")
@@ -2952,6 +3229,8 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
     )
+    app.add_handler(CommandHandler("categories", categories_cmd))
+    app.add_handler(CallbackQueryHandler(categories_callback, pattern=r"^cat:(store|source|cat|page|back|report|period):"))
     app.add_handler(CommandHandler("wow", wow_menu))
     app.add_handler(CommandHandler("direct_wow", wow_menu))
     app.add_handler(CallbackQueryHandler(wow_choice, pattern=r"^(wm:(services|accessories|direct|sales|pickup|conversion|ktc|average)|ws:(all|back|[0-9]+))$"))
