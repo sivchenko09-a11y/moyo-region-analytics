@@ -1641,7 +1641,10 @@ async def sync_cmd(update, context):
 
 
 
-def direct_week_comparison(as_of=None):
+def weekly_metric_comparison(metric="direct", as_of=None):
+    if metric not in ("direct", "accessories", "services"):
+        raise ValueError("Невідомий показник")
+    metric_title={"direct":"ПРЯМІ ПРОДАЖІ","accessories":"АКСЕСУАРИ","services":"ПОСЛУГИ"}[metric]
     """Compare complete weekdays this week against identical weekdays last week.
 
     Google sales tabs are month-to-date, so derive_daily_sales computes differences.
@@ -1658,17 +1661,17 @@ def direct_week_comparison(as_of=None):
     missing=[]
     for d in previous_dates + current_dates:
         frame=frames.get(d.isoformat())
-        if frame is None or frame.empty or 'direct' not in frame.columns:
+        if frame is None or frame.empty or metric not in frame.columns:
             missing.append(d.strftime('%d.%m.%Y'))
-        elif (frame['direct'].isna().any() or set(frame['store']) != set(STORE_ORDER)):
+        elif (frame[metric].isna().any() or set(frame['store']) != set(STORE_ORDER)):
             missing.append(d.strftime('%d.%m.%Y') + ' (неповні дані)')
     if missing:
-        return ('📊 ПРЯМІ | ТИЖДЕНЬ ДО ТИЖНЯ\n'
+        return (f'📊 {metric_title} | ТИЖДЕНЬ ДО ТИЖНЯ\n'
                 'Не можу коректно порівняти періоди: відсутні або неповні дані за '
                 + ', '.join(missing) + '.\n'
                 'Онови вкладки через /sync. Для розрахунку потрібні всі завершені дні та дані всіх магазинів.')
     def store_totals(dates):
-        return pd.concat([frames[d.isoformat()][['store','direct']] for d in dates]).groupby('store')['direct'].sum()
+        return pd.concat([frames[d.isoformat()][['store',metric]] for d in dates]).groupby('store')[metric].sum()
     old=store_totals(previous_dates)
     new=store_totals(current_dates)
     old_total=float(old.sum()); new_total=float(new.sum()); delta=new_total-old_total
@@ -1677,7 +1680,7 @@ def direct_week_comparison(as_of=None):
     def money(v): return f'{v:,.0f}'.replace(',', ' ')
     def change_str(v): return '— (нульова база)' if v is None else f'{sign(v)}{v:.1f}%'
     lines=[
-        '📊 ПРЯМІ ПРОДАЖІ | ТИЖДЕНЬ ДО ТИЖНЯ',
+        f'📊 {metric_title} | ТИЖДЕНЬ ДО ТИЖНЯ',
         f'📅 Минулий: {previous_dates[0]:%d.%m}–{previous_dates[-1]:%d.%m.%Y}',
         f'📅 Поточний: {current_dates[0]:%d.%m}–{current_dates[-1]:%d.%m.%Y}',
         f'Однакові дні: {n} (без сьогодні)', '',
@@ -1695,23 +1698,49 @@ def direct_week_comparison(as_of=None):
     return '\n'.join(lines)
 
 
-async def direct_wow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def wow_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
     if update.effective_chat.type != 'private':
-        await update.effective_message.reply_text('🔒 Цей звіт доступний лише в приватному чаті з ботом.')
+        await update.effective_message.reply_text('🔒 Порівняння доступне лише в особистому чаті.')
         return
+    await update.effective_message.reply_text(
+        '📊 ТИЖДЕНЬ ДО ТИЖНЯ\\nЩо хочеш порівняти?',
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton('💵 Прямі продажі', callback_data='wow:direct')],
+            [InlineKeyboardButton('🎧 Аксесуари', callback_data='wow:accessories')],
+            [InlineKeyboardButton('🛠 Послуги', callback_data='wow:services')],
+        ]),
+    )
+
+
+async def wow_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query=update.callback_query
+    if not is_owner(update):
+        await query.answer('Немає доступу.', show_alert=True)
+        return
+    if update.effective_chat.type != 'private':
+        await query.answer('Тільки в особистому чаті.', show_alert=True)
+        return
+    metric=query.data.split(':',1)[1]
+    if metric not in ('direct','accessories','services'):
+        await query.answer('Невідомий показник.', show_alert=True)
+        return
+    await query.answer()
     try:
-        report=await asyncio.to_thread(direct_week_comparison)
-        await update.effective_message.reply_text(report, parse_mode='HTML')
+        report=await asyncio.to_thread(weekly_metric_comparison, metric)
+        await query.message.reply_text(report, parse_mode='HTML')
     except Exception as exc:
-        log.exception('Direct WoW report failed')
-        await update.effective_message.reply_text(f'❌ Не вдалося сформувати порівняння прямих: {exc}')
+        log.exception('Weekly metric comparison failed: %s', metric)
+        await query.message.reply_text(f'❌ Не вдалося сформувати порівняння: {exc}')
+
 
 async def setup_commands(app):
     await app.bot.set_my_commands([
         BotCommand("focus", "🎯 Фокуси + категорії"),
-        BotCommand("direct_wow", "Прямі: цей тиждень проти минулого"),
+        BotCommand("wow", "Порівняти прямі, аксесуари або послуги"),
+        BotCommand("direct_wow", "Вибір порівняння тиждень до тижня"),
         BotCommand("group_test", "Тест відправки у групу"),
         BotCommand("interim_test", "Тест проміжкового звіту 1С"),
         BotCommand("group_here", "Дізнатись ID групи"),
@@ -2838,7 +2867,9 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
     )
-    app.add_handler(CommandHandler("direct_wow", direct_wow_cmd))
+    app.add_handler(CommandHandler("wow", wow_menu))
+    app.add_handler(CommandHandler("direct_wow", wow_menu))
+    app.add_handler(CallbackQueryHandler(wow_choice, pattern=r"^wow:(direct|accessories|services)$"))
     app.add_handler(CommandHandler("test", private_test_menu))
     app.add_handler(CallbackQueryHandler(private_test_selected, pattern=r"^private_test:(day|month|week|interim)$"))
     app.add_handler(CommandHandler("group_here", group_here))
