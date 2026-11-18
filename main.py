@@ -1121,7 +1121,7 @@ def google_table(session, sheet_id, title):
     raise ValueError(f"У вкладці {title} не знайдено заголовок Склад.")
 
 
-def fetch_monthly_plans(session):
+def fetch_monthly_plans(session, only_month=None):
     response = session.get(f"https://sheets.googleapis.com/v4/spreadsheets/{PLANS_SHEET_ID}",
                            params={"fields": "sheets.properties.title"}, timeout=45)
     response.raise_for_status()
@@ -1140,7 +1140,11 @@ def fetch_monthly_plans(session):
     if not months:
         raise ValueError("Таблиця планів: назви вкладки місяцями у форматі ММ.РРРР, наприклад 11.2026.")
     records = []
+    if only_month and only_month not in months:
+        raise ValueError(f"У таблиці планів немає вкладки {datetime.strptime(only_month, chr(37)+chr(89)+chr(37)+chr(109)):%m.%Y}.")
     for month, title in months.items():
+        if only_month and month != only_month:
+            continue
         try:
             frame = google_table(session, PLANS_SHEET_ID, title)
             frame = frame.loc[~frame.apply(lambda row: all(pd.isna(v) or str(v).strip() == "" for v in row), axis=1)].copy()
@@ -2524,7 +2528,7 @@ def refresh_interim_plans(report_day):
     credentials = Credentials.from_service_account_info(
         json.loads(config), scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
     with AuthorizedSession(credentials) as session:
-        records = fetch_monthly_plans(session)
+        records = fetch_monthly_plans(session, only_month=report_day.strftime("%m.%Y"))
     month = report_day.strftime("%Y-%m")
     current = {store: (sales, accessories, services)
                for m, store, sales, accessories, services in records if m == month}
@@ -2711,13 +2715,21 @@ async def private_test_selected(update, context):
             picture = await asyncio.to_thread(performance_dashboard, "month", yesterday)
             caption = f"🧪 ТЕСТ • МОЙО — місячний тренд станом на {yesterday:%d.%m.%Y}"
         else:
-            # Reuse stored monthly plans; do not refresh all Google Sheets for a preview.
+            # Load current month plans independently from sales/quality tabs.
+            # If Google temporarily rate-limits, use existing cached plans if complete.
+            try:
+                await asyncio.to_thread(refresh_interim_plans, today)
+            except Exception as plan_exc:
+                cached = load_monthly_plans(today.strftime("%Y-%m"))
+                if not set(STORE_ORDER).issubset(set(cached.index)) or cached[["sales","accessories","services"]].isna().any().any():
+                    raise ValueError(f"Не вдалося завантажити плани: {plan_exc}") from plan_exc
+                log.warning("Using cached monthly plans for private interim test: %s", plan_exc)
             rate, data, _ = await asyncio.to_thread(fetch_interim_sheet_with_retry, today, True)
             hour = datetime.now(REPORT_TZ).hour
             slot = 21 if hour >= 21 else 18 if hour >= 18 else 15
             picture = await asyncio.to_thread(interim_dashboard, today, slot, rate, data, None, True)
-            caption = (f"🧪 ТЕСТ • МОЙО — проміжковий звіт 1С ({today:%d.%m.%Y})\\n"
-                       f"🕒 Перевірено: {datetime.now(REPORT_TZ):%H:%M} (Київ)\\n"
+            caption = (f"🧪 ТЕСТ • МОЙО — проміжковий звіт 1С ({today:%d.%m.%Y})\n"
+                       f"🕒 Перевірено: {datetime.now(REPORT_TZ):%H:%M} (Київ)\n"
                        f"Курс: {rate:g} грн/$\n"
                        f"🏬 Дані є: {len(data)}/{len(STORE_ORDER)} магазинів. Відсутні позначені на зображенні.")
         await context.bot.send_photo(chat_id=chat_id, photo=picture, caption=caption)
