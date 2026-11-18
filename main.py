@@ -2965,10 +2965,10 @@ def category_db():
         conn=sqlite3.connect(DB_PATH, timeout=30)
     except sqlite3.OperationalError as exc:
         raise RuntimeError(f"Не вдалося відкрити SQLite за шляхом {DB_PATH}: {exc}. Перевір Railway Volume та DB_PATH.") from exc
-    conn.execute('''CREATE TABLE IF NOT EXISTS category_sales (
+    conn.execute('''CREATE TABLE IF NOT EXISTS category_sales_v2 (
        year INTEGER, month INTEGER, week INTEGER, store TEXT, category TEXT,
-       subcategory TEXT, itemgroup TEXT, source TEXT, amount REAL,
-       PRIMARY KEY(year,month,week,store,category,subcategory,itemgroup,source))''')
+       subcategory TEXT, itemgroup TEXT, brand TEXT, source TEXT, amount REAL,
+       PRIMARY KEY(year,month,week,store,category,subcategory,itemgroup,brand,source))''')
     conn.commit()
     return conn
 
@@ -3001,7 +3001,8 @@ def parse_category_workbook(raw):
             filename=f'xl/worksheets/sheet{idx}.xml'
             if filename not in z.namelist():raise ValueError(f'Немає даних вкладки {sheet}')
             month_by_col={};week_by_col={}
-            store=category=subcategory=itemgroup=None
+            store=category=subcategory=itemgroup=brand=None
+            pending=None
             def cell_data(c):
                 v=c.find(CAT_NS+'v')
                 if v is not None:
@@ -3025,11 +3026,23 @@ def parse_category_workbook(raw):
                     elif rn>4:
                         label=str(cells.get(0,('',None))[0] or '').strip()
                         if not label:row.clear();continue
+                        # A style-18 label is ambiguous: it can be a subcategory or a brand.
+                        # The NEXT structural row disambiguates it: a style-16 item group
+                        # means subcategory; an order-source row means brand.
+                        if pending is not None:
+                            heading=pending; pending=None
+                            if itemgroup is None or (cells.get(0,('',None))[1]=='16' and not re.match(r'^\d{2}\.\s',label)):
+                                subcategory=heading; itemgroup=None; brand=None
+                            elif label in CATEGORY_SOURCES:
+                                brand=heading
+                            else:
+                                # A new category/store boundary must never inherit stale brand.
+                                brand=None
                         if label in STORE_ORDER or ('Київ-'+label) in STORE_ORDER:
                             store=label if label in STORE_ORDER else 'Київ-'+label
-                            category=subcategory=itemgroup=None
+                            category=subcategory=itemgroup=brand=None
                         elif re.match(r'^\d{2}\.\s',label):
-                            category=label;subcategory=itemgroup=None
+                            category=label;subcategory=itemgroup=brand=None
                         elif label in CATEGORY_SOURCES:
                             if store and category and (itemgroup or subcategory):
                                 source=CATEGORY_SOURCES[label]
@@ -3037,14 +3050,14 @@ def parse_category_workbook(raw):
                                     if col not in week_by_col or col not in month_by_col:continue
                                     value=_cat_amount(v)
                                     if value is None:continue
-                                    key=(year,month_by_col[col],week_by_col[col],store,category,subcategory or '',itemgroup or '',source)
+                                    key=(year,month_by_col[col],week_by_col[col],store,category,subcategory or '',itemgroup or '',brand or '',source)
                                     results[key]+=value
                         elif store and category:
                             style=cells.get(0,('',None))[1]
                             # Pivot export: subcategory headings use style 18;
                             # product groups use style 16 (as do top categories).
-                            if style=='18':subcategory=label;itemgroup=None
-                            elif style=='16':itemgroup=label
+                            if style=='18':pending=label
+                            elif style=='16':itemgroup=label;brand=None
                             else:
                                 # Never silently assign an ambiguous subtotal as a product group.
                                 pass
@@ -3058,8 +3071,8 @@ def import_categories(raw):
     try:
         with conn:
             # Full snapshot: updated quarter replaces old figures, not added to them.
-            conn.execute('DELETE FROM category_sales')
-            conn.executemany('INSERT INTO category_sales VALUES (?,?,?,?,?,?,?,?,?)',
+            conn.execute('DELETE FROM category_sales_v2')
+            conn.executemany('INSERT INTO category_sales_v2 VALUES (?,?,?,?,?,?,?,?,?,?)',
                              [(*k,round(v,4)) for k,v in parsed.items()])
     finally:conn.close()
     return len(parsed),len(set(k[0:3] for k in parsed)),len(set(k[3] for k in parsed))
@@ -3070,13 +3083,13 @@ def category_options(prefix,store,source,year=None,month=None,week=None):
         clauses=['1=1'];params=[]
         if store:clauses.append('store=?');params.append(store)
         if source!='all':clauses.append('source=?');params.append(source)
-        for col,val in zip(('category','subcategory','itemgroup'),prefix):
+        for col,val in zip(('category','subcategory','itemgroup','brand'),prefix):
             clauses.append(col+'=?');params.append(val)
-        field=('category','subcategory','itemgroup')[len(prefix)]
+        field=('category','subcategory','itemgroup','brand')[len(prefix)]
         if year:clauses.append('year=?');params.append(year)
         if month:clauses.append('month=?');params.append(month)
         if week:clauses.append('week=?');params.append(week)
-        return [r[0] for r in conn.execute(f'SELECT DISTINCT {field} FROM category_sales WHERE '+ ' AND '.join(clauses)+f' AND {field}<>\'\' ORDER BY {field}',params)]
+        return [r[0] for r in conn.execute(f'SELECT DISTINCT {field} FROM category_sales_v2 WHERE '+ ' AND '.join(clauses)+f' AND {field}<>\'\' ORDER BY {field}',params)]
     finally:conn.close()
 
 def category_amount(prefix,store,source,period,period_id):
@@ -3085,18 +3098,18 @@ def category_amount(prefix,store,source,period,period_id):
         clauses=[];params=[]
         if store:clauses.append('store=?');params.append(store)
         if source!='all':clauses.append('source=?');params.append(source)
-        for col,val in zip(('category','subcategory','itemgroup'),prefix):clauses.append(col+'=?');params.append(val)
+        for col,val in zip(('category','subcategory','itemgroup','brand'),prefix):clauses.append(col+'=?');params.append(val)
         if period=='week':
             clauses+=['year=?','week=?'];params.extend(period_id)
         else:
             clauses+=['year=?','month=?'];params.extend(period_id)
-        sql='SELECT COALESCE(SUM(amount),0) FROM category_sales WHERE '+' AND '.join(clauses)
+        sql='SELECT COALESCE(SUM(amount),0) FROM category_sales_v2 WHERE '+' AND '.join(clauses)
         return float(conn.execute(sql,params).fetchone()[0])
     finally:conn.close()
 
 def category_child_comparison(prefix, store, source, period, previous, current):
     """Break down the selected category by its immediate child, not by subtotals."""
-    if len(prefix) >= 3:
+    if len(prefix) >= 4:
         return []
     field = ('category', 'subcategory', 'itemgroup')[len(prefix)]
     clauses = [f"{field} <> ''"]
@@ -3113,7 +3126,7 @@ def category_child_comparison(prefix, store, source, period, previous, current):
         period_clause = 'year=? AND month=?'
     conn = category_db()
     try:
-        sql = (f'SELECT {field}, SUM(amount) FROM category_sales WHERE '
+        sql = (f'SELECT {field}, SUM(amount) FROM category_sales_v2 WHERE '
                + ' AND '.join(clauses) + ' AND ' + period_clause
                + f' GROUP BY {field}')
         old = dict(conn.execute(sql, [*params, *previous]).fetchall())
@@ -3126,8 +3139,8 @@ def category_child_comparison(prefix, store, source, period, previous, current):
 def category_periods(period):
     conn=category_db()
     try:
-        if period=='week':return conn.execute('SELECT DISTINCT year,week FROM category_sales ORDER BY year DESC,week DESC').fetchall()
-        return conn.execute('SELECT DISTINCT year,month FROM category_sales ORDER BY year DESC,month DESC').fetchall()
+        if period=='week':return conn.execute('SELECT DISTINCT year,week FROM category_sales_v2 ORDER BY year DESC,week DESC').fetchall()
+        return conn.execute('SELECT DISTINCT year,month FROM category_sales_v2 ORDER BY year DESC,month DESC').fetchall()
     finally:conn.close()
 
 def cat_keyboard(options,kind='cat',page=0):
@@ -3306,7 +3319,7 @@ async def categories_callback(update,context):
                         f'{"+" if delta>0 else ""}{number(delta)} $ ({change})')
                 if len(message)+len(line)>3500:
                     await q.message.reply_text(message, parse_mode='HTML')
-                    message='📂 <b>Підкатегорії (продовження)</b>'
+                    message='📂 <b>Деталізація (продовження)</b>'
                 message+=line
         await q.message.reply_text(message,parse_mode='HTML')
         return
@@ -3320,167 +3333,119 @@ async def categories_callback(update,context):
                 [InlineKeyboardButton('⬅️ Назад',callback_data='cat:period:back')]]))
         return
     if state['step']=='browse':
-        options=category_options(state['path'],state['store'],state['source']) if len(state['path'])<3 else []
+        options=category_options(state['path'],state['store'],state['source']) if len(state['path'])<4 else []
         await q.edit_message_text('📂 '+(' → '.join(state['path']) or 'Усі категорії')+'\nОберіть підкатегорію або аналіз:',
                                   reply_markup=cat_keyboard(options,page=state['page']))
 
 
-# Category demand outlook: historical seasonality + latest completed weeks.
-def category_forecast_text(path, store, source):
-    from datetime import date
-    today=datetime.now(REPORT_TZ).date()
-    this_monday=today-timedelta(days=today.weekday())
-    last_monday=this_monday-timedelta(days=7)
-    target_monday=this_monday+timedelta(days=7)
-    ty,tw,_=target_monday.isocalendar()
-    ly=ty-1
-    # Compare the same ISO week, rather than the same calendar date.
+# Category demand outlook: transparent forecast, YoY, and actual-to-date.
+def _forecast_period_data(path, store, source, period):
     conn=category_db()
     try:
-        clauses=['1=1'];params=[]
-        if store:clauses.append('store=?');params.append(store)
-        if source!='all':clauses.append('source=?');params.append(source)
-        for field,value in zip(('category','subcategory','itemgroup'),path):
-            clauses.append(field+'=?');params.append(value)
-        field=('category','subcategory','itemgroup')[len(path)] if len(path)<3 else None
-        fields='year,week'+(','+field if field else '')+',SUM(amount)'
-        where=' AND '.join(clauses)
-        rows=conn.execute(f'SELECT {fields} FROM category_sales WHERE {where} GROUP BY '+
-                          ('year,week,'+field if field else 'year,week'),params).fetchall()
+        clauses=['1=1']; params=[]
+        if store: clauses.append('store=?');params.append(store)
+        if source!='all': clauses.append('source=?');params.append(source)
+        for column,value in zip(('category','subcategory','itemgroup','brand'),path):
+            clauses.append(column+'=?');params.append(value)
+        child=('category','subcategory','itemgroup','brand')[len(path)] if len(path)<4 else None
+        group='year,'+period+(','+child if child else '')
+        rows=conn.execute('SELECT '+group+',SUM(amount) FROM category_sales_v2 WHERE '+' AND '.join(clauses)+' GROUP BY '+group,params).fetchall()
+        available=set(conn.execute('SELECT DISTINCT year,'+period+' FROM category_sales_v2').fetchall())
+        latest=conn.execute('SELECT MAX(year),MAX(month) FROM category_sales_v2').fetchone()
     finally:conn.close()
     series=defaultdict(dict)
-    for y,w,*tail in rows:
-        if field:name,amount=tail
-        else:name='Вибрана категорія';amount=tail[0]
-        series[name][(int(y),int(w))]=float(amount)
-    # Check presence globally: zero in one category is legitimate, missing week globally is not.
-    available=set(category_periods('week'))
-    historical=(ly,tw)
-    if historical not in available:
-        return f'🔮 Прогноз на тиждень {tw} ({ty})\nНемає історії за тиждень {tw} {ly} року. Для сезонного прогнозу потрібна база минулого року.'
-    recent=[];historical_prior=[]
-    for offset in (2,3,4):
-        day=target_monday-timedelta(weeks=offset)
-        iso=day.isocalendar();recent.append((iso.year,iso.week))
-        try:
-            prior=date.fromisocalendar(ly,iso.week,1)
-            historical_prior.append((prior.isocalendar().year,prior.isocalendar().week))
-        except ValueError:
-            return 'Неможливо зіставити ISO-тижні для цього періоду.'
-    if any(key not in available for key in recent+historical_prior):
-        missing=[f'{y}/{w}' for y,w in recent+historical_prior if (y,w) not in available]
-        return '🔮 Для прогнозу бракує завершених тижнів: '+', '.join(missing)+'. Онови Google Sheets і виконай /catsync.'
-    estimates=[]
-    for name,values in series.items():
-        base=sum(values.get(k,0) for k in historical_prior)/3
-        last=sum(values.get(k,0) for k in recent)/3
-        seasonal=values.get(historical,0)
-        if base<30 or last<30:
-            continue
-        factor=seasonal/base
-        # Avoid a single volatile historical week dominating the projection.
-        conservative=max(0.5,min(1.75,factor))
-        estimate=last*conservative
-        estimates.append((name,estimate,last,seasonal,factor))
-    heading=(f'🔮 ПРОГНОЗ КАТЕГОРІЙ | тиждень {tw} ({ty})\n'
-             f'📅 {target_monday:%d.%m}–{target_monday+timedelta(days=6):%d.%m.%Y}\n'
-             f'🏬 {store or "Весь регіон"}\n'
-             f'📂 {" → ".join(path) or "Усі категорії"}\n'
-             f'Джерело: {source}\n\n'
-             'Метод: середній оборот 3 завершених тижнів × сезонний коефіцієнт аналогічного тижня 2025 року. '
-             'Коефіцієнт обмежено діапазоном 0,50–1,75. Це орієнтир, не план і не гарантія.\n')
-    if not estimates:
-        return heading+'\nНедостатньо порівнянних ненульових продажів для прогнозу.'
-    total=sum(x[1] for x in estimates)
-    lines=[heading,f'\nОрієнтовний оборот груп із достатньою історією (не весь оборот): ${total:,.0f}'.replace(',',' ')]
-    if field:
-        lines.append('\n📂 Категорії з найбільшим прогнозованим оборотом:')
-        for name,estimate,last,seasonal,factor in sorted(estimates,key=lambda x:x[1],reverse=True)[:10]:
-            trend='↗️' if factor>1.05 else '↘️' if factor<0.95 else '➡️'
-            lines.append(f'{trend} {name}: ${estimate:,.0f} (попередній рік: ${seasonal:,.0f}; сезонний індекс {factor:.2f}×)'.replace(',',' '))
-        rising=sorted((x for x in estimates if x[4]>1.1),key=lambda x:x[4],reverse=True)[:3]
-        if rising:
-            lines.append('\n🎯 Підготовка: перевірити залишки й комплекти у групах із сезонним зростанням: '+', '.join(x[0] for x in rising)+'.')
-    else:
-        lines.append('\n🎯 Підготовка: перевірити залишки ходових позицій та комплекти до основного товару.')
-    lines.append('\n⚠️ Не враховано акції, залишки, поставки та зміни цін. Поточний незавершений тиждень не використовується.')
-    return '\n'.join(lines)
+    for y,p,*tail in rows:
+        name,amount=(tail[0],tail[1]) if child else ('Вибрана категорія',tail[0])
+        series[name][(int(y),int(p))]=float(amount)
+    return series,available,child
 
-
-
-def category_month_forecast_text(path, store, source):
-    """Next calendar month forecast based on completed months and prior-year seasonality."""
+def _forecast_report(path,store,source,mode):
+    from datetime import date
+    import calendar
     today=datetime.now(REPORT_TZ).date()
-    if today.month==12:
-        target_year,target_month=today.year+1,1
+    if mode=='week':
+        this_start=today-timedelta(days=today.weekday())
+        target=this_start+timedelta(days=7)
+        y,p,_=target.isocalendar()
+        historical=(y-1,p)
+        recent=[];prior=[]
+        for offset in (2,3,4):
+            d=target-timedelta(weeks=offset);iso=d.isocalendar()
+            recent.append((iso.year,iso.week));prior.append((y-1,iso.week))
+        current=(today.isocalendar().year,today.isocalendar().week)
+        # Pivot has only weekly totals, not daily sales; current week is NOT a verified as-of-today fact.
+        current_label=f'Поточний тиждень {current[1]} ({current[0]})'
+        target_label=f'тиждень {p} ({y}) | {target:%d.%m}–{target+timedelta(days=6):%d.%m.%Y}'
+        period='week'; minimum=30
     else:
-        target_year,target_month=today.year,today.month+1
-    # Only complete months are used; current month is excluded.
-    latest_complete=today.replace(day=1)-timedelta(days=1)
-    recent=[]
-    for i in range(3):
-        y=latest_complete.year
-        m=latest_complete.month-i
-        while m<=0:y-=1;m+=12
-        recent.append((y,m))
-    prior=[(y-1,m) for y,m in recent]
-    historical=(target_year-1,target_month)
-    conn=category_db()
-    try:
-        clauses=['1=1'];params=[]
-        if store:clauses.append('store=?');params.append(store)
-        if source!='all':clauses.append('source=?');params.append(source)
-        for field,value in zip(('category','subcategory','itemgroup'),path):
-            clauses.append(field+'=?');params.append(value)
-        field=('category','subcategory','itemgroup')[len(path)] if len(path)<3 else None
-        cols='year,month'+(','+field if field else '')+',SUM(amount)'
-        where=' AND '.join(clauses)
-        rows=conn.execute(f'SELECT {cols} FROM category_sales WHERE {where} GROUP BY '+
-                          ('year,month,'+field if field else 'year,month'),params).fetchall()
-        # Availability is based on all categories, not selected category.
-        available=set(conn.execute('SELECT DISTINCT year,month FROM category_sales').fetchall())
-    finally:conn.close()
-    heading=(f'📆 ПРОГНОЗ КАТЕГОРІЙ | {target_month:02d}.{target_year}\n'
-             f'🏬 {store or "Весь регіон"}\n'
-             f'📂 {" → ".join(path) or "Усі категорії"}\n'
+        y,p=(today.year+1,1) if today.month==12 else (today.year,today.month+1)
+        historical=(y-1,p)
+        complete=today.replace(day=1)-timedelta(days=1)
+        recent=[];prior=[]
+        for offset in range(3):
+            yy=complete.year;mm=complete.month-offset
+            while mm<=0:yy-=1;mm+=12
+            recent.append((yy,mm));prior.append((yy-1,mm))
+        current=(today.year,today.month)
+        current_label=f'Поточний місяць {today:%m.%Y}'
+        target_label=f'місяць {p:02d}.{y}'
+        period='month';minimum=100
+    series,available,child=_forecast_period_data(path,store,source,period)
+    heading=(f'🔮 ПРОГНОЗ КАТЕГОРІЙ | {target_label}\n'
+             f'🏬 {store or "Весь регіон"}\n📂 {" → ".join(path) or "Усі категорії"}\n'
              f'Джерело: {source}\n')
     needed=[historical,*recent,*prior]
-    missing=[f'{m:02d}.{y}' for y,m in needed if (y,m) not in available]
+    missing=[f'{v[0]}/{v[1]}' for v in needed if v not in available]
     if missing:
-        return heading+'\n⚠️ Для сезонного прогнозу бракує місячних даних: '+', '.join(dict.fromkeys(missing))+'. Онови Google Sheets через /catsync.'
-    series=defaultdict(dict)
-    for y,m,*tail in rows:
-        if field:name,amount=tail
-        else:name='Вибрана категорія';amount=tail[0]
-        series[name][(int(y),int(m))]=float(amount)
+        return heading+'\n⚠️ Бракує історичних періодів: '+', '.join(dict.fromkeys(missing))+'. Онови /catsync.'
     estimates=[]
     for name,values in series.items():
         base=sum(values.get(k,0) for k in prior)/3
         recent_avg=sum(values.get(k,0) for k in recent)/3
-        seasonal=values.get(historical,0)
-        if base<100 or recent_avg<100:continue
-        raw_factor=seasonal/base
-        used_factor=max(.5,min(1.75,raw_factor))
-        estimate=recent_avg*used_factor
-        estimates.append((name,estimate,recent_avg,seasonal,raw_factor,used_factor))
-    heading+=('\nМетод: середній оборот 3 останніх завершених місяців × сезонний індекс '
-              'відповідного місяця минулого року. Для розрахунку індекс обмежено 0,50–1,75×. '
-              'Це орієнтир, не план і не гарантія.\n'
-              f'Останній завершений місяць: {latest_complete:%m.%Y}.\n')
-    if not estimates:return heading+'\nНедостатньо історії продажів для надійного розрахунку.'
-    total=sum(row[1] for row in estimates)
-    lines=[heading, f'\nОрієнтовний оборот груп із достатньою історією (не весь оборот): {fmt(total)}']
-    if field:
-        lines.append('\n📂 Категорії з найбільшим прогнозованим оборотом:')
-        for name,estimate,last,seasonal,raw,used in sorted(estimates,key=lambda x:x[1],reverse=True)[:10]:
-            icon='↗️' if used>1.05 else '↘️' if used<.95 else '➡️'
-            lines.append(f'{icon} {name}: {fmt(estimate)} (аналогічний місяць торік: {fmt(seasonal)}; індекс {raw:.2f}×, застосовано {used:.2f}×)')
-        rising=sorted((row for row in estimates if row[5]>1.1),key=lambda row:row[1],reverse=True)[:3]
-        if rising:lines.append('\n🎯 Підготовка: перевірити залишки, комплекти та готовність продавців у категоріях: '+', '.join(row[0] for row in rising)+'.')
-    else:
-        lines.append('\n🎯 Підготовка: перевірити залишки ходових товарів, комплекти та презентацію супутніх послуг.')
-    lines.append('\n⚠️ Прогноз не враховує акції, майбутні поставки, залишки та ціни. Поточний неповний місяць не використовується.')
+        last_year=values.get(historical,0)
+        if base<minimum or recent_avg<minimum:continue
+        raw=last_year/base
+        applied=max(.5,min(1.75,raw))
+        prediction=recent_avg*applied
+        estimates.append((name,prediction,last_year,raw,applied))
+    if not estimates:return heading+'\n⚠️ Недостатньо історії для прогнозу.'
+    total=sum(v[1] for v in estimates)
+    total_py=sum(v[2] for v in estimates)
+    # The current pivot week/month can be partial, or reflect a future-filled template.
+    # Without dated daily facts, label it as the last imported period, not "as of today".
+    current_values=sum(v.get(current,0) for v in series.values())
+    actual_status='наявний у Google Sheets зріз; дата останнього продажу невідома' if current in available else 'дані ще не завантажені'
+    number=lambda v:f'{v:,.0f}'.replace(',',' ')
+    yoy=(f'{(total/total_py-1)*100:+.1f}%' if total_py else '— (немає бази)')
+    lines=[heading,
+        f'📌 Прогноз груп із достатньою історією: {number(total)} $ (НЕ весь оборот)',
+        f'📅 Факт цих груп за аналогічний період торік: {number(total_py)} $',
+        f'📈 Прогноз до минулого року: {"+" if total>=total_py else ""}{number(total-total_py)} $ ({yoy})',
+        f'💵 {current_label}: {number(current_values)} $ — {actual_status}.',
+        '⚠️ Поточний факт — за ІНШИЙ період, ніж прогноз. Він не додається до прогнозу наступного тижня/місяця.',
+        '\nМетод: середнє 3 завершених періодів × сезонний індекс аналогічного періоду торік. '
+        'Застосований коефіцієнт 0,50–1,75×.']
+    if child:
+        lines.append('\n📂 Прогноз за категоріями (прогноз | торік | зміна YoY):')
+        for name,pred,py,raw,applied in sorted(estimates,key=lambda r:r[1],reverse=True)[:12]:
+            delta=pred-py
+            change=f'{delta/py*100:+.1f}%' if py else 'нова база'
+            icon='🟢' if delta>0 else '🔴' if delta<0 else '⚪'
+            lines.append(f'{icon} {name}: {number(pred)} $ | {number(py)} $ | {"+" if delta>=0 else ""}{number(delta)} $ ({change}); сезонність {raw:.2f}× → застосовано {applied:.2f}×')
+        negatives=sorted((r for r in estimates if r[1]<r[2]),key=lambda r:r[1]-r[2])[:3]
+        positives=sorted((r for r in estimates if r[1]>r[2]),key=lambda r:r[1]-r[2],reverse=True)[:3]
+        if negatives:lines.append('\n🎯 Ризики: '+', '.join(r[0] for r in negatives)+'. Перевірити залишки, викладку, причини падіння та плани продажів.')
+        if positives:lines.append('📦 Можливе зростання: '+', '.join(r[0] for r in positives)+'. Підготувати товарні запаси й комплекти.')
+    else:lines.append('\n🎯 Перевірити залишки, викладку, комплекти та готовність продавців.')
+    lines.append('\n⚠️ Без урахування майбутніх акцій, поставок і цін. Прогноз — орієнтир, не план. '
+                 'Для точного факту станом на сьогодні потрібні щоденні дані, а не тижневий/місячний pivot.')
     return '\n'.join(lines)
+
+def category_forecast_text(path,store,source):
+    return _forecast_report(path,store,source,'week')
+
+def category_month_forecast_text(path,store,source):
+    return _forecast_report(path,store,source,'month')
 
 async def forecast_cmd(update,context):
     if not is_owner(update):return
@@ -3562,7 +3527,7 @@ def sync_categories_google():
     try:
         category_sync_state(conn)
         previous = conn.execute("SELECT signature,rows FROM category_sync_state WHERE id=1").fetchone()
-        populated = conn.execute("SELECT EXISTS(SELECT 1 FROM category_sales LIMIT 1)").fetchone()[0]
+        populated = conn.execute("SELECT EXISTS(SELECT 1 FROM category_sales_v2 LIMIT 1)").fetchone()[0]
         if previous and previous[0] == digest and populated:
             return False, previous[1]
     finally:
@@ -3573,8 +3538,8 @@ def sync_categories_google():
     try:
         with conn:
             category_sync_state(conn)
-            conn.execute("DELETE FROM category_sales")
-            conn.executemany("INSERT INTO category_sales VALUES (?,?,?,?,?,?,?,?,?)",
+            conn.execute("DELETE FROM category_sales_v2")
+            conn.executemany("INSERT INTO category_sales_v2 VALUES (?,?,?,?,?,?,?,?,?,?)",
                              [(*key, round(value,4)) for key,value in parsed.items()])
             conn.execute("""INSERT OR REPLACE INTO category_sync_state
                 (id,signature,updated_at,rows) VALUES (1,?,?,?)""",
