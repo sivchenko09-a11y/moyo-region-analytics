@@ -2640,6 +2640,71 @@ async def interim_loop(app):
             log.exception('Interim report poll failed; will retry')
 
 
+
+# Private-only interactive preview. Does not touch scheduled-send state.
+async def private_test_menu(update, context):
+    if not is_owner(update):
+        return
+    if update.effective_chat.type != "private":
+        await update.effective_message.reply_text("🔒 Команда /test доступна лише в особистому чаті з ботом.")
+        return
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 За минулий день", callback_data="private_test:day")],
+        [InlineKeyboardButton("📈 Місячний тренд", callback_data="private_test:month")],
+        [InlineKeyboardButton("📅 Тижневий звіт", callback_data="private_test:week")],
+        [InlineKeyboardButton("📊 Проміжковий звіт 1С", callback_data="private_test:interim")],
+    ])
+    await update.effective_message.reply_text(
+        "🧪 Тест звітів — обери звіт. Надішлю його тільки сюди, не в групу.",
+        reply_markup=keyboard,
+    )
+
+async def private_test_selected(update, context):
+    query = update.callback_query
+    if not is_owner(update):
+        await query.answer("Немає доступу.", show_alert=True)
+        return
+    if update.effective_chat.type != "private":
+        await query.answer("Тест доступний лише в особистому чаті.", show_alert=True)
+        return
+    kind = query.data.split(":", 1)[1]
+    if kind not in ("day", "month", "week", "interim"):
+        await query.answer("Невідомий звіт.", show_alert=True)
+        return
+    await query.answer()
+    chat_id = update.effective_chat.id
+    today = datetime.now(REPORT_TZ).date()
+    yesterday = today - timedelta(days=1)
+    try:
+        await context.bot.send_message(chat_id=chat_id, text="🔄 Формую тестовий звіт…")
+        if kind == "day":
+            await asyncio.to_thread(sync_google_sheets)
+            await asyncio.to_thread(sync_focus_google)
+            picture = await asyncio.to_thread(digest_dashboard, yesterday)
+            caption = f"🧪 ТЕСТ • МОЙО — за минулий день ({yesterday:%d.%m.%Y})"
+        elif kind == "week":
+            last_sunday = today - timedelta(days=today.weekday()+1)
+            await asyncio.to_thread(sync_google_sheets)
+            picture = await asyncio.to_thread(performance_dashboard, "week", last_sunday)
+            caption = f"🧪 ТЕСТ • МОЙО — тижневий звіт до {last_sunday:%d.%m.%Y}"
+        elif kind == "month":
+            await asyncio.to_thread(sync_google_sheets)
+            picture = await asyncio.to_thread(performance_dashboard, "month", yesterday)
+            caption = f"🧪 ТЕСТ • МОЙО — місячний тренд станом на {yesterday:%d.%m.%Y}"
+        else:
+            await asyncio.to_thread(refresh_interim_plans, today)
+            rate, data, _ = await asyncio.to_thread(fetch_interim_sheet, today)
+            hour = datetime.now(REPORT_TZ).hour
+            slot = 21 if hour >= 21 else 18 if hour >= 18 else 15
+            picture = await asyncio.to_thread(interim_dashboard, today, slot, rate, data)
+            caption = (f"🧪 ТЕСТ • МОЙО — проміжковий звіт 1С ({today:%d.%m.%Y})\\n"
+                       f"🕒 Перевірено: {datetime.now(REPORT_TZ):%H:%M} (Київ)\\n"
+                       f"Курс: {rate:g} грн/$")
+        await context.bot.send_photo(chat_id=chat_id, photo=picture, caption=caption)
+    except Exception as exc:
+        log.exception("Private test %s failed", kind)
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ Не вдалося сформувати звіт: {exc}")
+
 async def setup_group_schedule(app):
     await setup_commands(app)
     app.create_task(digest_loop(app), name="group-digest-12-kyiv")
@@ -2662,6 +2727,8 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
     )
+    app.add_handler(CommandHandler("test", private_test_menu))
+    app.add_handler(CallbackQueryHandler(private_test_selected, pattern=r"^private_test:(day|month|week|interim)$"))
     app.add_handler(CommandHandler("group_here", group_here))
     app.add_handler(CommandHandler("group_test", group_test))
     app.add_handler(CommandHandler("interim_test", interim_test))
