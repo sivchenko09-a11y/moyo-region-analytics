@@ -3094,6 +3094,35 @@ def category_amount(prefix,store,source,period,period_id):
         return float(conn.execute(sql,params).fetchone()[0])
     finally:conn.close()
 
+def category_child_comparison(prefix, store, source, period, previous, current):
+    """Break down the selected category by its immediate child, not by subtotals."""
+    if len(prefix) >= 3:
+        return []
+    field = ('category', 'subcategory', 'itemgroup')[len(prefix)]
+    clauses = [f"{field} <> ''"]
+    params = []
+    if store:
+        clauses.append('store=?'); params.append(store)
+    if source != 'all':
+        clauses.append('source=?'); params.append(source)
+    for col, val in zip(('category', 'subcategory', 'itemgroup'), prefix):
+        clauses.append(f'{col}=?'); params.append(val)
+    if period == 'week':
+        period_clause = 'year=? AND week=?'
+    else:
+        period_clause = 'year=? AND month=?'
+    conn = category_db()
+    try:
+        sql = (f'SELECT {field}, SUM(amount) FROM category_sales WHERE '
+               + ' AND '.join(clauses) + ' AND ' + period_clause
+               + f' GROUP BY {field}')
+        old = dict(conn.execute(sql, [*params, *previous]).fetchall())
+        new = dict(conn.execute(sql, [*params, *current]).fetchall())
+    finally:
+        conn.close()
+    return [(name, float(old.get(name, 0)), float(new.get(name, 0)))
+            for name in sorted(set(old) | set(new))]
+
 def category_periods(period):
     conn=category_db()
     try:
@@ -3109,6 +3138,7 @@ def cat_keyboard(options,kind='cat',page=0):
     if start+8<len(options):controls.append(InlineKeyboardButton('▶️',callback_data=f'cat:page:{page+1}'))
     if controls:buttons.append(controls)
     buttons.append([InlineKeyboardButton('📊 Аналіз цього рівня',callback_data='cat:report:0')])
+    buttons.append([InlineKeyboardButton('🔮 Прогноз наступного тижня',callback_data='cat:forecast:0')])
     buttons.append([InlineKeyboardButton('⬅️ Назад',callback_data='cat:back:0')])
     return InlineKeyboardMarkup(buttons)
 
@@ -3121,6 +3151,38 @@ async def categories_cmd(update,context):
     await update.effective_message.reply_text('📊 КАТЕГОРІЇ\nОберіть магазин:',reply_markup=InlineKeyboardMarkup(
         [[InlineKeyboardButton('🌍 Весь регіон',callback_data='cat:store:all')]]+
         [[InlineKeyboardButton(s.replace('Київ-',''),callback_data=f'cat:store:{i}')] for i,s in enumerate(STORE_ORDER)]))
+
+def valid_category_periods(mode):
+    periods=category_periods('week' if mode=='week' else 'month')
+    today=datetime.now(REPORT_TZ).date()
+    if mode=='week':
+        iso=today.isocalendar()
+        return [p for p in periods if p<(iso.year,iso.week)]
+    return [p for p in periods if p<(today.year,today.month)]
+
+async def show_category_period_picker(q,state):
+    mode=state.get('mode','week')
+    periods=valid_category_periods(mode)
+    page=max(0,int(state.get('period_page',0)))
+    if page*10>=len(periods):page=max(0,(len(periods)-1)//10)
+    state['period_page']=page
+    buttons=[]
+    for i in range(page*10,min(len(periods),(page+1)*10)):
+        year,number=periods[i]
+        if mode=='week':
+            from datetime import date
+            start=date.fromisocalendar(year,number,1)
+            label=f'📅 Тиждень {number} ({start:%d.%m}–{start+timedelta(days=6):%d.%m.%Y})'
+        else:
+            label=f'🗓 {number:02d}.{year}'
+        buttons.append([InlineKeyboardButton(label,callback_data=f'cat:periodpick:{i}')])
+    nav=[]
+    if page:nav.append(InlineKeyboardButton('◀️ Новіші',callback_data=f'cat:periodpage:{page-1}'))
+    if (page+1)*10<len(periods):nav.append(InlineKeyboardButton('Старіші ▶️',callback_data=f'cat:periodpage:{page+1}'))
+    if nav:buttons.append(nav)
+    buttons.append([InlineKeyboardButton('⬅️ Назад',callback_data='cat:periodback:0')])
+    await q.edit_message_text('Оберіть '+('тиждень' if mode=='week' else 'місяць')+' для порівняння:',
+                              reply_markup=InlineKeyboardMarkup(buttons))
 
 async def categories_callback(update,context):
     q=update.callback_query
@@ -3164,6 +3226,10 @@ async def categories_callback(update,context):
         i=int(value)
         if i>=len(options):await q.message.reply_text('Список оновився. Відкрий /categories знову.');return
         state['path'].append(options[i]);state['page']=0
+    elif kind=='forecast':
+        report=await asyncio.to_thread(category_forecast_text,state['path'],state['store'],state['source'])
+        for i in range(0,len(report),3500):await q.message.reply_text(report[i:i+3500])
+        return
     elif kind=='report':
         state['step']='period'
         await q.edit_message_text('📊 '+(' → '.join(state['path']) or 'Усі категорії')+'\nОберіть порівняння:',
@@ -3174,43 +3240,181 @@ async def categories_callback(update,context):
                 [InlineKeyboardButton('⬅️ Назад',callback_data='cat:period:back')]]))
         return
     elif kind=='period':
-        if value=='back':state['step']='browse'
+        if value=='back':
+            state['step']='browse'
         else:
-            mode=value
-            periods=category_periods('week' if mode=='week' else 'month')
-            today=datetime.now(REPORT_TZ).date()
-            if mode=='week':
-                y,w,_=today.isocalendar()
-                periods=[p for p in periods if p<(y,w)]
-            else:
-                periods=[p for p in periods if p<(today.year,today.month)]
-            if not periods:await q.message.reply_text('Спочатку завантаж файл категорій.');return
-            newest=periods[0]
-            if mode=='year':
-                prev=(newest[0]-1,newest[1])
-            else:
-                prev=periods[1] if len(periods)>1 else None
-            if not prev or prev not in periods:
-                await q.message.reply_text('Немає попереднього періоду для порівняння.');return
-            a=category_amount(state['path'],state['store'],state['source'],'week' if mode=='week' else 'month',prev)
-            b=category_amount(state['path'],state['store'],state['source'],'week' if mode=='week' else 'month',newest)
-            d=b-a
-            marker='🟢' if d>0 else '🔴' if d<0 else '⚪'
-            pct=f'{d/a*100:+.1f}%' if a else '— (нульова база)'
-            fmt=lambda n:f'{n:,.0f}'.replace(',',' ')
-            await q.message.reply_text(
-                f'📊 КАТЕГОРІЇ | {"ТИЖДЕНЬ" if mode=="week" else "МІСЯЦЬ" if mode=="month" else "РІК"} ДО {"ТИЖНЯ" if mode=="week" else "МІСЯЦЯ" if mode=="month" else "РОКУ"}\n'
-                f'🏬 {html.escape(state["store"] or "Весь регіон")}\n'
-                f'📁 {html.escape(" → ".join(state["path"]) or "Усі категорії")}\n'
-                f'Джерело: {state["source"]}\n'
-                f'{prev[0]} / {prev[1]}: {fmt(a)} $\n'
-                f'{newest[0]} / {newest[1]}: {fmt(b)} $\n'
-                f'{marker} <b>{d:+,.0f} $ ({pct})</b>'.replace(',', ' '),parse_mode='HTML')
+            state['mode']=value
+            state['step']='pickperiod'
+            state['period_page']=0
+            await show_category_period_picker(q,state)
             return
+    elif kind=='periodpage':
+        state['period_page']=int(value)
+        await show_category_period_picker(q,state)
+        return
+    elif kind=='periodpick':
+        mode=state.get('mode','week')
+        periods=valid_category_periods(mode)
+        i=int(value)
+        if i<0 or i>=len(periods):
+            await q.message.reply_text('Список періодів змінився. Почни з /categories.')
+            return
+        newest=periods[i]
+        if mode=='week':
+            from datetime import date
+            monday=date.fromisocalendar(newest[0],newest[1],1)
+            prior=monday-timedelta(days=7)
+            prev=(prior.isocalendar().year,prior.isocalendar().week)
+        elif mode=='year':
+            prev=(newest[0]-1,newest[1])
+        else:
+            prev=(newest[0]-1,12) if newest[1]==1 else (newest[0],newest[1]-1)
+        available=set(category_periods('week' if mode=='week' else 'month'))
+        if prev not in available:
+            await q.message.reply_text('Немає даних за попередній період: '+str(prev)+'.')
+            return
+        period='week' if mode=='week' else 'month'
+        a=category_amount(state['path'],state['store'],state['source'],period,prev)
+        b=category_amount(state['path'],state['store'],state['source'],period,newest)
+        d=b-a
+        marker='🟢' if d>0 else '🔴' if d<0 else '⚪'
+        percent=f'{d/a*100:+.1f}%' if a else '— (нульова база)'
+        number=lambda n:f'{n:,.0f}'.replace(',',' ')
+        unit='тиждень' if mode=='week' else 'місяць'
+        title={'week':'ТИЖДЕНЬ ДО ТИЖНЯ','month':'МІСЯЦЬ ДО МІСЯЦЯ','year':'РІК ДО РОКУ'}[mode]
+        message = (
+            f'📊 КАТЕГОРІЇ | {title}\n'
+            f'🏬 {html.escape(state["store"] or "Весь регіон")}\n'
+            f'📁 {html.escape(" → ".join(state["path"]) or "Усі категорії")}\n'
+            f'Джерело: {state["source"]}\n'
+            f'{prev[0]} / {unit} {prev[1]}: {number(a)} $\n'
+            f'{newest[0]} / {unit} {newest[1]}: {number(b)} $\n'
+            f'{marker} <b>{number(d)} $ ({percent})</b>')
+        children = category_child_comparison(
+            state['path'], state['store'], state['source'], period, prev, newest)
+        if children:
+            message += '\n\n📂 <b>ДЕТАЛІЗАЦІЯ ПІДКАТЕГОРІЙ</b>'
+            # Show every immediate child, including ones that fell to zero.
+            # Split at Telegram's 4096-character message limit.
+            for name, old, new in sorted(children, key=lambda x: abs(x[2]-x[1]), reverse=True):
+                delta = new-old
+                symbol = '🟢' if delta > 0.005 else '🔴' if delta < -0.005 else '⚪'
+                change = f'{delta/old*100:+.1f}%' if old else ('нова база' if new else '—')
+                line = (f'\n\n{symbol} <b>{html.escape(name)}</b>\n'
+                        f'{number(old)} → {number(new)} $ | '
+                        f'{"+" if delta>0 else ""}{number(delta)} $ ({change})')
+                if len(message)+len(line)>3500:
+                    await q.message.reply_text(message, parse_mode='HTML')
+                    message='📂 <b>Підкатегорії (продовження)</b>'
+                message+=line
+        await q.message.reply_text(message,parse_mode='HTML')
+        return
+    elif kind=='periodback':
+        state['step']='period'
+        await q.edit_message_text('📊 '+(' → '.join(state['path']) or 'Усі категорії')+'\nОберіть порівняння:',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton('📅 Тиждень до тижня',callback_data='cat:period:week')],
+                [InlineKeyboardButton('🗓 Місяць до місяця',callback_data='cat:period:month')],
+                [InlineKeyboardButton('📆 Рік до року',callback_data='cat:period:year')],
+                [InlineKeyboardButton('⬅️ Назад',callback_data='cat:period:back')]]))
+        return
     if state['step']=='browse':
         options=category_options(state['path'],state['store'],state['source']) if len(state['path'])<3 else []
         await q.edit_message_text('📂 '+(' → '.join(state['path']) or 'Усі категорії')+'\nОберіть підкатегорію або аналіз:',
                                   reply_markup=cat_keyboard(options,page=state['page']))
+
+
+# Category demand outlook: historical seasonality + latest completed weeks.
+def category_forecast_text(path, store, source):
+    from datetime import date
+    today=datetime.now(REPORT_TZ).date()
+    this_monday=today-timedelta(days=today.weekday())
+    last_monday=this_monday-timedelta(days=7)
+    target_monday=this_monday+timedelta(days=7)
+    ty,tw,_=target_monday.isocalendar()
+    ly=ty-1
+    # Compare the same ISO week, rather than the same calendar date.
+    conn=category_db()
+    try:
+        clauses=['1=1'];params=[]
+        if store:clauses.append('store=?');params.append(store)
+        if source!='all':clauses.append('source=?');params.append(source)
+        for field,value in zip(('category','subcategory','itemgroup'),path):
+            clauses.append(field+'=?');params.append(value)
+        field=('category','subcategory','itemgroup')[len(path)] if len(path)<3 else None
+        fields='year,week'+(','+field if field else '')+',SUM(amount)'
+        where=' AND '.join(clauses)
+        rows=conn.execute(f'SELECT {fields} FROM category_sales WHERE {where} GROUP BY '+
+                          ('year,week,'+field if field else 'year,week'),params).fetchall()
+    finally:conn.close()
+    series=defaultdict(dict)
+    for y,w,*tail in rows:
+        if field:name,amount=tail
+        else:name='Вибрана категорія';amount=tail[0]
+        series[name][(int(y),int(w))]=float(amount)
+    # Check presence globally: zero in one category is legitimate, missing week globally is not.
+    available=set(category_periods('week'))
+    historical=(ly,tw)
+    if historical not in available:
+        return f'🔮 Прогноз на тиждень {tw} ({ty})\nНемає історії за тиждень {tw} {ly} року. Для сезонного прогнозу потрібна база минулого року.'
+    recent=[];historical_prior=[]
+    for offset in (2,3,4):
+        day=target_monday-timedelta(weeks=offset)
+        iso=day.isocalendar();recent.append((iso.year,iso.week))
+        try:
+            prior=date.fromisocalendar(ly,iso.week,1)
+            historical_prior.append((prior.isocalendar().year,prior.isocalendar().week))
+        except ValueError:
+            return 'Неможливо зіставити ISO-тижні для цього періоду.'
+    if any(key not in available for key in recent+historical_prior):
+        missing=[f'{y}/{w}' for y,w in recent+historical_prior if (y,w) not in available]
+        return '🔮 Для прогнозу бракує завершених тижнів: '+', '.join(missing)+'. Онови Google Sheets і виконай /catsync.'
+    estimates=[]
+    for name,values in series.items():
+        base=sum(values.get(k,0) for k in historical_prior)/3
+        last=sum(values.get(k,0) for k in recent)/3
+        seasonal=values.get(historical,0)
+        if base<30 or last<30:
+            continue
+        factor=seasonal/base
+        # Avoid a single volatile historical week dominating the projection.
+        conservative=max(0.5,min(1.75,factor))
+        estimate=last*conservative
+        estimates.append((name,estimate,last,seasonal,factor))
+    heading=(f'🔮 ПРОГНОЗ КАТЕГОРІЙ | тиждень {tw} ({ty})\n'
+             f'📅 {target_monday:%d.%m}–{target_monday+timedelta(days=6):%d.%m.%Y}\n'
+             f'🏬 {store or "Весь регіон"}\n'
+             f'📂 {" → ".join(path) or "Усі категорії"}\n'
+             f'Джерело: {source}\n\n'
+             'Метод: середній оборот 3 завершених тижнів × сезонний коефіцієнт аналогічного тижня 2025 року. '
+             'Коефіцієнт обмежено діапазоном 0,50–1,75. Це орієнтир, не план і не гарантія.\n')
+    if not estimates:
+        return heading+'\nНедостатньо порівнянних ненульових продажів для прогнозу.'
+    total=sum(x[1] for x in estimates)
+    lines=[heading,f'\nОрієнтовний оборот груп із достатньою історією (не весь оборот): ${total:,.0f}'.replace(',',' ')]
+    if field:
+        lines.append('\n📂 Категорії з найбільшим прогнозованим оборотом:')
+        for name,estimate,last,seasonal,factor in sorted(estimates,key=lambda x:x[1],reverse=True)[:10]:
+            trend='↗️' if factor>1.05 else '↘️' if factor<0.95 else '➡️'
+            lines.append(f'{trend} {name}: ${estimate:,.0f} (попередній рік: ${seasonal:,.0f}; сезонний індекс {factor:.2f}×)'.replace(',',' '))
+        rising=sorted((x for x in estimates if x[4]>1.1),key=lambda x:x[4],reverse=True)[:3]
+        if rising:
+            lines.append('\n🎯 Підготовка: перевірити залишки й комплекти у групах із сезонним зростанням: '+', '.join(x[0] for x in rising)+'.')
+    else:
+        lines.append('\n🎯 Підготовка: перевірити залишки ходових позицій та комплекти до основного товару.')
+    lines.append('\n⚠️ Не враховано акції, залишки, поставки та зміни цін. Поточний незавершений тиждень не використовується.')
+    return '\n'.join(lines)
+
+async def forecast_cmd(update,context):
+    if not is_owner(update):return
+    if update.effective_chat.type!='private':return
+    state=context.user_data.get('cat')
+    if not state:
+        await update.effective_message.reply_text('Спочатку вибери магазин і категорію через /categories, потім натисни 🔮 Прогноз.')
+        return
+    report=await asyncio.to_thread(category_forecast_text,state['path'],state['store'],state['source'])
+    for i in range(0,len(report),3500):
+        await update.effective_message.reply_text(report[i:i+3500])
 
 async def category_upload(update,context):
     if not is_owner(update):return
@@ -3353,7 +3557,8 @@ def main():
     )
     app.add_handler(CommandHandler("catsync", categories_sync_cmd, block=False))
     app.add_handler(CommandHandler("categories", categories_cmd))
-    app.add_handler(CallbackQueryHandler(categories_callback, pattern=r"^cat:(store|source|cat|page|back|report|period):"))
+    app.add_handler(CommandHandler("forecast", forecast_cmd))
+    app.add_handler(CallbackQueryHandler(categories_callback, pattern=r"^cat:(store|source|cat|page|back|report|period|periodpick|periodpage|periodback|forecast):"))
     app.add_handler(CommandHandler("wow", wow_menu))
     app.add_handler(CommandHandler("direct_wow", wow_menu))
     app.add_handler(CallbackQueryHandler(wow_choice, pattern=r"^(wm:(services|accessories|direct|sales|pickup|conversion|ktc|average)|ws:(all|back|[0-9]+))$"))
