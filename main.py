@@ -1876,115 +1876,145 @@ def digest_dashboard(day):
     focus=focus_data()
     if not any(k[1]==key for k in focus):
         raise ValueError('Немає фокусів за звітний день')
-    W=1120; row_h=47; H=1320+len(ranking)*row_h
-    im=Image.new('RGB',(W,H),'#eaf2fb'); d=ImageDraw.Draw(im)
-    # Matplotlib bundles DejaVu TTF fonts with full Ukrainian Cyrillic support.
-    # Install matplotlib in requirements.txt on Railway.
-    from pathlib import Path as _FontPath
-    try:
-        import matplotlib
-        _mpl_fonts = _FontPath(matplotlib.get_data_path()) / "fonts" / "ttf"
-    except ImportError as exc:
-        raise RuntimeError(
-            "Для українських написів на картинці додай matplotlib>=3.8 "
-            "до requirements.txt та повторно розгорни Railway."
-        ) from exc
 
-    def f(size, bold=False):
-        name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
-        path = _mpl_fonts / name
-        if not path.is_file():
-            raise RuntimeError(f"Не знайдено шрифт з підтримкою кирилиці: {path}")
-        return ImageFont.truetype(str(path), size)
-
-    def rect(x0,y0,x1,y1,fill,r=18): d.rounded_rectangle((x0,y0,x1,y1),radius=r,fill=fill)
-    def txt(x,y,t,size=22,color='#172d4a',bold=False): d.text((x,y),str(t),font=f(size,bold),fill=color)
-    def money(v): return '$'+format(round(v),',').replace(',',' ')
-    def bar(x,y,width,val):
-        rect(x,y,x+width,y+13,'#e0e9f1',6)
-        if val is not None:
-            color='#1bbf66' if val>=100 else '#ef535a' if val<90 else '#f0b52e'
-            if val>0: rect(x,y,x+max(5,int(width*min(val,100)/100)),y+13,color,6)
-    def pct(v): return 'н/д' if v is None else f'{v:.1f}%'
-    rect(18,15,W-18,93,'#11375d',19)
-    txt(45,34,'MOYO  |  РЕГІОН — ПІДСУМКИ ЗА ВЧОРА',29,'white',True)
-    txt(875,42,day.strftime('%d.%m.%Y'),24,'white',True)
-    rect(18,110,535,445,'white'); rect(550,110,1102,445,'white')
-    txt(38,128,'ФІНАНСОВІ ПОКАЗНИКИ',24,bold=True)
-    total_sales=float(frame['sales'].sum())
-    for i,(metric,label) in enumerate([('sales','Оборот'),('direct','Прямі продажі'),('pickup','Пікап'),('accessories','Аксесуари'),('services','Послуги')]):
-        y=175+i*51
-        rect(37,y,515,y+43,'#eef4fa',9)
-        txt(55,y+8,label,21)
-        amount=money(frame[metric].sum())
-        bbox=d.textbbox((0,0),amount,font=f(22,True))
-        txt(499-(bbox[2]-bbox[0]),y+7,amount,22,bold=True)
-        if metric in ('accessories','services'):
-            share = float(frame[metric].sum())/total_sales*100 if total_sales else None
-            share_label = f'Частка {share:.2f}%' if share is not None else 'Частка н/д'
-            txt(280,y+13,share_label,15,'#42658b',True)
-    txt(570,128,'ВИКОНАННЯ ДЕННОГО ПЛАНУ',23,bold=True)
-    for i,(label,val) in enumerate(region):
-        cx=645+i*176; cy=272
-        color='#18b965' if val is not None and val>=100 else '#f0b52e' if val is not None and val>=90 else '#ef535a'
-        d.ellipse((cx-64,cy-64,cx+64,cy+64),outline='#e2eaf5',width=15)
-        if val is not None:
-            d.arc((cx-64,cy-64,cx+64,cy+64),-90,-90+max(1,min(val,100)/100*359),fill=color,width=15)
-        value=pct(val); bbox=d.textbbox((0,0),value,font=f(25,True))
-        txt(cx-(bbox[2]-bbox[0])/2,cy-15,value,25,bold=True)
-        bbox=d.textbbox((0,0),label,font=f(19,True))
-        txt(cx-(bbox[2]-bbox[0])/2,cy+83,label,19,bold=True)
-    table_top=462; table_end=table_top+96+len(ranking)*row_h
-    rect(18,table_top,1102,table_end,'white')
-    txt(40,table_top+14,'МАГАЗИНИ — ВИКОНАННЯ ПЛАНУ (%)',26,bold=True)
-    head=table_top+58; rect(38,head,1082,head+42,'#203f6a',8)
-    for x,t in [(55,'Магазин'),(395,'Оборот'),(620,'Аксесуари'),(867,'Послуги')]: txt(x,head+8,t,19,'white',True)
-    for i,(store,vals) in enumerate(ranking):
-        y=head+48+i*row_h
-        if i%2==0: rect(39,y,1081,y+43,'#f0f5fb',6)
-        txt(54,y+10,aliases.get(store,store.removeprefix('Київ-'))[:23],19,bold=True)
-        for j,(x,v) in enumerate(zip((395,620,867),vals)):
-            col='#11834a' if v is not None and v>=100 else '#d4424b' if v is not None and v<90 else '#bb8500'
-            txt(x,y+9,pct(v),19,col,True)
-            bar(x+105,y+16,100,v)
-    # Top / bottom 3 stores by turnover daily plan attainment.
-    y=table_end+16
-    rect(18,y,1102,y+224,'white')
-    txt(39,y+13,'ТОП / АНТИТОП МАГАЗИНІВ — ОБОРОТ',25,bold=True)
-    txt(48,y+57,'ТОП 3',22,'#11834a',True)
-    txt(580,y+57,'АНТИТОП 3',22,'#d4424b',True)
-    eligible=[(store,vals[0]) for store,vals in ranking if vals[0] is not None]
-    leaders=eligible[:3]
-    laggards=list(reversed(eligible[-3:]))
-    for i in range(3):
-        yy=y+94+i*39
-        for x,items,color in ((48,leaders,'#11834a'),(580,laggards,'#d4424b')):
-            if i>=len(items):
-                continue
-            store,value=items[i]
-            name=aliases.get(store,store.removeprefix('Київ-'))[:21]
-            txt(x,yy,f'{i+1}. {name}',19,bold=True)
-            txt(x+370,yy,pct(value),19,color,True)
-    y+=240
-    rect(18,y,1102,y+238,'white')
-    txt(39,y+14,f'ТРЕНД РЕГІОНУ | 01.{trend_day:%m.%Y}–{trend_day:%d.%m.%Y}',25,bold=True)
+    # The same 1700px visual language and dense plan/fact/%/share table as 1C.
+    from matplotlib import font_manager
+    W, H = 1700, 2110
+    im = Image.new('RGB', (W,H), '#e7f2ff')
+    d = ImageDraw.Draw(im)
+    regular = font_manager.findfont(font_manager.FontProperties(family='DejaVu Sans'))
+    boldfont = font_manager.findfont(font_manager.FontProperties(family='DejaVu Sans', weight='bold'))
+    fonts = {}
+    def ft(n, bold=False):
+        key=(n,bold)
+        if key not in fonts:
+            fonts[key]=ImageFont.truetype(boldfont if bold else regular,n)
+        return fonts[key]
+    def rect(x0,y0,x1,y1,fill,r=16):
+        d.rounded_rectangle((x0,y0,x1,y1),radius=r,fill=fill)
+    def txt(x,y,v,n=20,c='#173455',b=False,anchor=None):
+        d.text((x,y),str(v),font=ft(n,b),fill=c,anchor=anchor)
+    def money(v): return f'{v:,.0f}'.replace(',',' ')
+    def pct(v): return '—' if v is None else f'{v:.1f}%'
+    def color(v): return '#079e5c' if v is not None and v>=100 else '#bf8700' if v is not None and v>=70 else '#d62735'
+    navy='#10355e'; muted='#52677f'
+    results=[]
+    for store in STORE_ORDER:
+        selected=frame[frame.store==store]
+        if len(selected)!=1:
+            raise ValueError(f'У звіті за {day:%d.%m.%Y} немає одного рядка для {store}')
+        r=selected.iloc[0]
+        values={k:float(r[k]) for k,_ in metrics}
+        targets={}
+        for k,_ in metrics:
+            v=target(store,k,r)
+            targets[k]=v/days if v is not None else None
+        results.append((store,values,targets))
+    totals={k:sum(v[k] for _,v,_ in results) for k,_ in metrics}
+    goals={k:sum(g[k] for _,_,g in results) if all(g[k] is not None for _,_,g in results) else None for k,_ in metrics}
+    def perf(a,g): return 100*a/g if g is not None and g>0 else None
+    rect(14,14,W-14,145,navy,24)
+    txt(40,27,'MOYO  |  ПІДСУМКИ ЗА ВЧОРА',44,'white',True)
+    txt(42,91,'РЕГІОН — ЦЕНТР    •    ДЕННИЙ ЗВІТ',23,'#c7e1fa')
+    txt(W-36,35,day.strftime('%d.%m.%Y'),30,'white',True,'ra')
+    txt(W-36,87,'Дані за завершений день  •  USD',21,'#dcecff',True,'ra')
+    cards=[('ОБОРОТ','sales','#216dc4'),('АКСЕСУАРИ','accessories','#0e9962'),('ПОСЛУГИ','services','#b63f62')]
+    cw=(W-56)//3
+    for i,(label,k,accent) in enumerate(cards):
+        x=14+i*(cw+14); rect(x,160,x+cw,495,'white',21)
+        rect(x+18,180,x+65,229,accent,12)
+        txt(x+78,184,label,27,navy,True)
+        txt(x+31,186,{'sales':'▣','accessories':'◇','services':'✦'}[k],27,'white',True)
+        txt(x+20,239,money(totals[k])+' $',39,accent if k!='sales' else navy,True)
+        p=perf(totals[k],goals[k])
+        rect(x+cw-161,178,x+cw-18,228,'#e1f4e9' if p is not None and p>=100 else '#e9f0fa',12)
+        txt(x+cw-90,187,pct(p),25,color(p),True,'ma')
+        for j,(name,value) in enumerate([('План, $',money(goals[k]) if goals[k] is not None else '—'),
+                                         ('Факт, $',money(totals[k])),('Виконання',pct(p))]):
+            yy=308+j*44
+            txt(x+22,yy,name,20,muted)
+            txt(x+cw-20,yy,value,22,color(p) if j==2 else navy,True,'ra')
+            if j<2: d.line((x+20,yy+33,x+cw-20,yy+33),fill='#e4edf7',width=2)
+        rect(x+20,446,x+cw-20,461,'#dce7f3',8)
+        if p is not None and p>0:
+            rect(x+20,446,x+20+(cw-40)*min(p,100)/100,461,accent,8)
+        if k!='sales':
+            share=100*totals[k]/totals['sales'] if totals['sales'] else 0
+            txt(x+cw-22,468,f'Частка в обороті: {share:.2f}%',19,navy,True,'ra')
+    rect(14,511,W-14,1505,'white',20)
+    txt(36,526,'МАГАЗИНИ — ВИКОНАННЯ ДЕННОГО ПЛАНУ',32,navy,True)
+    rect(30,587,1670,687,navy,12)
+    txt(43,621,'Магазин',22,'white',True)
+    for mid,name in ((480,'ОБОРОТ'),(931,'АКСЕСУАРИ'),(1426,'ПОСЛУГИ')):
+        txt(mid,595,name,23,'white',True,'ma')
+    for x,label in [(380,'План'),(500,'Факт'),(635,'%'),(786,'План'),(905,'Факт'),
+                    (1052,'%'),(1160,'Частка'),(1280,'План'),(1390,'Факт'),
+                    (1538,'%'),(1650,'Частка')]:
+        txt(x,645,label,18,'#dcecff',True,'ra')
+    short={'Буча-Рітейл Парк':'Буча-Рітейл','Київ-Аладдін':'Аладін',
+           'Київ-Аркадія':'Аркадія','Київ-Блокбастер':'Блокбастер',
+           'Київ-Дрімтаун_new':'Дрім Таун','Київ-Квадрат':'Квадрат',
+           'Київ-Комод':'Комод','Київ-Лавіна Молл':'Лавіна',
+           'Київ-Материк':'Материк','Київ-Нью Вей':'Нью Вей',
+           'Київ-Олімпійський':'Олімпійський',
+           'Київ-Республіка Парк':'Республіка Парк',
+           'Київ-Ретровіль':'Ретровіль','Київ-Хрещатик 21':'Хрещатик 21'}
+    for i,(store,vals,plan) in enumerate(results):
+        y=690+i*54
+        if i%2==0: rect(30,y,1670,y+52,'#eef5fd',5)
+        txt(43,y+13,short.get(store,store),21,navy,True)
+        for k,xp,xf,xe,xs in (('sales',380,500,556,None),
+                               ('accessories',786,905,973,1160),
+                               ('services',1280,1390,1458,1650)):
+            pp=perf(vals[k],plan[k])
+            share=100*vals[k]/vals['sales'] if vals['sales'] else 0
+            txt(xp,y+14,money(plan[k]) if plan[k] is not None else '—',19,muted,False,'ra')
+            txt(xf,y+12,money(vals[k]),23,navy,True,'ra')
+            if pp is not None:
+                rect(xe,y+8,xe+90,y+44,
+                     '#dff7e9' if pp>=100 else '#fff1ce' if pp>=70 else '#ffe3e8',9)
+                txt(xe+45,y+11,pct(pp),20,color(pp),True,'ma')
+            if xs is not None: txt(xs,y+14,f'{share:.1f}%',19,navy,True,'ra')
+    yy=690+14*54+5
+    rect(30,yy,1670,yy+53,navy,8)
+    txt(43,yy+13,'РАЗОМ',20,'white',True)
+    for k,xp,xf,xe,xs in (('sales',380,500,556,None),
+                           ('accessories',786,905,973,1160),
+                           ('services',1280,1390,1458,1650)):
+        txt(xp,yy+13,money(goals[k]) if goals[k] is not None else '—',19,'white',True,'ra')
+        txt(xf,yy+13,money(totals[k]),20,'white',True,'ra')
+        txt(xe+82,yy+13,pct(perf(totals[k],goals[k])),20,'#b9f2d6',True,'ra')
+        if xs is not None:
+            txt(xs,yy+13,f'{100*totals[k]/totals["sales"] if totals["sales"] else 0:.1f}%',19,'white',True,'ra')
+    rect(14,1522,837,1816,'white',20); rect(851,1522,1686,1816,'white',20)
+    rect(30,1539,822,1598,'#dcf6e9',13); rect(866,1539,1670,1598,'#fbe5e8',13)
+    txt(50,1551,'↑ ТОП-3  •  ОБОРОТ',29,'#07854e',True)
+    txt(885,1551,'↓ АНТИТОП-3  •  ОБОРОТ',29,'#c82e43',True)
+    ranking=[(store,perf(vals['sales'],plan['sales']),vals['sales']) for store,vals,plan in results]
+    ranking=[v for v in ranking if v[1] is not None]
+    ranking.sort(key=lambda z:z[1],reverse=True)
+    for x,group in ((50,ranking[:3]),(870,list(reversed(ranking[-3:])))):
+        for i,(store,pc,actual) in enumerate(group):
+            y=1620+i*60
+            txt(x,y,f'{i+1}. {short.get(store,store)}',20,navy,True)
+            txt(x+530,y,pct(pc),21,color(pc),True)
+            txt(x+745,y,money(actual)+' $',21,navy,True,'ra')
+    rect(14,1832,1686,2080,'white',20)
+    txt(36,1846,'МІСЯЧНИЙ ТРЕНД РЕГІОНУ',27,navy,True)
     for i,(label,value,actual,forecast) in enumerate(trends):
-        yy=y+59+i*53
-        txt(42,yy,label,20,bold=True)
-        txt(235,yy,pct(value),24,'#11834a' if value is not None and value>=100 else '#d4424b',True)
-        bar(375,yy+11,200,value)
-        txt(600,yy,'Факт: '+money(actual) if actual is not None else 'Немає даних',17)
-        txt(835,yy,'Прогноз: '+money(forecast) if forecast is not None else '—',17)
-    y+=254
-    rect(18,y,1102,y+145,'white')
-    txt(40,y+13,'ФОКУСИ ЗА ВЧОРА',25,bold=True)
+        y=1901+i*43
+        txt(42,y,label,20,navy,True)
+        txt(295,y,pct(value),23,color(value),True)
+        txt(505,y,'Факт: '+money(actual)+' $' if actual is not None else 'Факт: —',19,navy)
+        txt(910,y,'Прогноз: '+money(forecast)+' $' if forecast is not None else 'Прогноз: —',19,navy)
+    txt(42,2042,'ФОКУСИ ЗА ДЕНЬ:',19,navy,True)
     for i,category in enumerate(('ЕЗ','Клімат')):
         unit=FOCUS_CONFIG[category][1]
-        txt(55,y+59+i*39,category+':  '+focus_pair(focus,category,unit,day,day),22,bold=True)
-    buf=io.BytesIO(); im.crop((0,0,W,y+165)).save(buf,format='PNG',optimize=True)
-    buf.seek(0); buf.name='moyo_digest.png'
+        txt(330+i*650,2042,category+': '+focus_pair(focus,category,unit,day,day),19,navy,True)
+    buf=io.BytesIO()
+    im.save(buf,format='PNG',optimize=True)
+    buf.seek(0); buf.name='moyo_daily_unified.png'
     return buf
-
 
 # Additional visual reports: completed week and current-month store trends.
 def performance_dashboard(mode, reference_day):
