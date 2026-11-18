@@ -2659,6 +2659,18 @@ async def private_test_menu(update, context):
         reply_markup=keyboard,
     )
 
+
+def fetch_interim_sheet_with_retry(report_day):
+    """Retry transient Sheets quota errors without touching the group schedule."""
+    import time
+    for attempt in range(4):
+        try:
+            return fetch_interim_sheet(report_day)
+        except Exception as exc:
+            if '429' not in str(exc) or attempt == 3:
+                raise
+            time.sleep((2 ** attempt) * 10)
+
 async def private_test_selected(update, context):
     query = update.callback_query
     if not is_owner(update):
@@ -2678,22 +2690,18 @@ async def private_test_selected(update, context):
     try:
         await context.bot.send_message(chat_id=chat_id, text="🔄 Формую тестовий звіт…")
         if kind == "day":
-            await asyncio.to_thread(sync_google_sheets)
-            await asyncio.to_thread(sync_focus_google)
             picture = await asyncio.to_thread(digest_dashboard, yesterday)
             caption = f"🧪 ТЕСТ • МОЙО — за минулий день ({yesterday:%d.%m.%Y})"
         elif kind == "week":
             last_sunday = today - timedelta(days=today.weekday()+1)
-            await asyncio.to_thread(sync_google_sheets)
             picture = await asyncio.to_thread(performance_dashboard, "week", last_sunday)
             caption = f"🧪 ТЕСТ • МОЙО — тижневий звіт до {last_sunday:%d.%m.%Y}"
         elif kind == "month":
-            await asyncio.to_thread(sync_google_sheets)
             picture = await asyncio.to_thread(performance_dashboard, "month", yesterday)
             caption = f"🧪 ТЕСТ • МОЙО — місячний тренд станом на {yesterday:%d.%m.%Y}"
         else:
-            await asyncio.to_thread(refresh_interim_plans, today)
-            rate, data, _ = await asyncio.to_thread(fetch_interim_sheet, today)
+            # Reuse stored monthly plans; do not refresh all Google Sheets for a preview.
+            rate, data, _ = await asyncio.to_thread(fetch_interim_sheet_with_retry, today)
             hour = datetime.now(REPORT_TZ).hour
             slot = 21 if hour >= 21 else 18 if hour >= 18 else 15
             picture = await asyncio.to_thread(interim_dashboard, today, slot, rate, data)
@@ -2702,6 +2710,9 @@ async def private_test_selected(update, context):
                        f"Курс: {rate:g} грн/$")
         await context.bot.send_photo(chat_id=chat_id, photo=picture, caption=caption)
     except Exception as exc:
+        if "429" in str(exc):
+            await context.bot.send_message(chat_id=chat_id, text="⏳ Google Sheets тимчасово обмежив запити (429). Зачекай 1–2 хвилини та спробуй ще раз.")
+            return
         log.exception("Private test %s failed", kind)
         await context.bot.send_message(chat_id=chat_id, text=f"❌ Не вдалося сформувати звіт: {exc}")
 
