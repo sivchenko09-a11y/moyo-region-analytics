@@ -1641,95 +1641,180 @@ async def sync_cmd(update, context):
 
 
 
-def weekly_metric_comparison(metric="direct", as_of=None):
-    if metric not in ("direct", "accessories", "services"):
-        raise ValueError("Невідомий показник")
-    metric_title={"direct":"ПРЯМІ ПРОДАЖІ","accessories":"АКСЕСУАРИ","services":"ПОСЛУГИ"}[metric]
-    """Compare complete weekdays this week against identical weekdays last week.
 
-    Google sales tabs are month-to-date, so derive_daily_sales computes differences.
-    Missing dates or stores are not interpreted as zero sales.
-    """
+WOW_METRICS = {
+    "services": ("🛠 ПОСЛУГИ", "money"),
+    "accessories": ("🎧 АКСЕСУАРИ", "money"),
+    "direct": ("💵 ПРЯМІ ПРОДАЖІ", "money"),
+    "sales": ("💰 ЗАГАЛЬНИЙ ОБОРОТ", "money"),
+    "pickup": ("📦 ПІКАП", "money"),
+    "conversion": ("📊 КОП", "percent"),
+    "ktc": ("🧾 КТЧ", "ratio"),
+    "average": ("🛒 СЕРЕДНІЙ ЧЕК", "money"),
+}
+
+def weekly_metric_comparison(metric="direct", store=None, as_of=None):
+    if metric not in WOW_METRICS:
+        raise ValueError("Невідомий показник")
+    if store is not None and store not in STORE_ORDER:
+        raise ValueError("Невідомий магазин")
+    title, kind = WOW_METRICS[metric]
     as_of = as_of or datetime.now(REPORT_TZ).date()
     monday = as_of - timedelta(days=as_of.weekday())
-    n = as_of.weekday()  # completed days before today (Monday=0)
+    n = as_of.weekday()
     if n == 0:
-        return "📊 ПРЯМІ | ТИЖДЕНЬ ДО ТИЖНЯ\nСьогодні понеділок. Порівняння буде доступне завтра після завантаження даних за понеділок."
+        return f'📊 {title} | ТИЖДЕНЬ ДО ТИЖНЯ\nПорівняння буде доступне у вівторок, коли будуть дані за понеділок.'
     current_dates = [monday + timedelta(days=i) for i in range(n)]
     previous_dates = [d - timedelta(days=7) for d in current_dates]
     frames = daily_frames()
-    missing=[]
-    for d in previous_dates + current_dates:
-        frame=frames.get(d.isoformat())
-        if frame is None or frame.empty or metric not in frame.columns:
-            missing.append(d.strftime('%d.%m.%Y'))
-        elif (frame[metric].isna().any() or set(frame['store']) != set(STORE_ORDER)):
-            missing.append(d.strftime('%d.%m.%Y') + ' (неповні дані)')
+    required = {
+        "conversion": ("traffic", "pudo", "receipts"),
+        "ktc": ("receipts", "estimated_items"),
+        "average": ("receipts", "quality_sales"),
+    }.get(metric, (metric,))
+    stores = [store] if store else STORE_ORDER
+    missing = []
+    for day in previous_dates + current_dates:
+        frame = frames.get(day.isoformat())
+        if frame is None or frame.empty or any(col not in frame.columns for col in required):
+            missing.append(day.strftime('%d.%m.%Y'))
+            continue
+        relevant = frame[frame.store.isin(stores)]
+        if set(relevant.store) != set(stores) or relevant[list(required)].isna().any().any():
+            missing.append(day.strftime('%d.%m.%Y') + ' (неповні дані)')
     if missing:
-        return (f'📊 {metric_title} | ТИЖДЕНЬ ДО ТИЖНЯ\n'
-                'Не можу коректно порівняти періоди: відсутні або неповні дані за '
-                + ', '.join(missing) + '.\n'
-                'Онови вкладки через /sync. Для розрахунку потрібні всі завершені дні та дані всіх магазинів.')
-    def store_totals(dates):
-        return pd.concat([frames[d.isoformat()][['store',metric]] for d in dates]).groupby('store')[metric].sum()
-    old=store_totals(previous_dates)
-    new=store_totals(current_dates)
-    old_total=float(old.sum()); new_total=float(new.sum()); delta=new_total-old_total
-    change=(delta/old_total*100) if old_total else None
-    sign=lambda v: '+' if v>0 else ''
-    def money(v): return f'{v:,.0f}'.replace(',', ' ')
-    def change_str(v): return '— (нульова база)' if v is None else f'{sign(v)}{v:.1f}%'
-    lines=[
-        f'📊 {metric_title} | ТИЖДЕНЬ ДО ТИЖНЯ',
+        return (f'📊 {title} | ТИЖДЕНЬ ДО ТИЖНЯ\n'
+                'Недостатньо даних: ' + ', '.join(missing) +
+                '.\nОнови звіти через /sync. Відсутні значення не замінюються нулями.')
+
+    def calculate(dates, selected_store):
+        parts = [frames[d.isoformat()] for d in dates]
+        combined = pd.concat(parts, ignore_index=True)
+        combined = combined[combined.store == selected_store] if selected_store else combined[combined.store.isin(stores)]
+        if kind == "money" and metric not in ("average",):
+            return float(combined[metric].sum())
+        receipts = float(combined.receipts.sum())
+        if metric == "conversion":
+            effective_traffic = float((combined.traffic - combined.pudo).sum())
+            return receipts / effective_traffic * 100 if effective_traffic > 0 else None
+        if metric == "ktc":
+            return float(combined.estimated_items.sum()) / receipts if receipts > 0 else None
+        if metric == "average":
+            return float(combined.quality_sales.sum()) / receipts if receipts > 0 else None
+        raise ValueError("Невідомий показник")
+
+    def fmt(value):
+        if value is None: return '—'
+        if kind == "percent": return f'{value:.2f}%'
+        if kind == "ratio": return f'{value:.2f}'
+        return f'{value:,.0f}'.replace(',', ' ') + ' $'
+
+    def delta_line(old, new):
+        if old is None or new is None:
+            return '⚪ <b>Недостатньо бази для розрахунку</b>'
+        diff = new - old
+        sign = '+' if diff > 0 else ''
+        color = '🟢' if diff > 0 else '🔴' if diff < 0 else '⚪'
+        if kind == "percent":
+            return f'{color} <b>{sign}{diff:.2f} в.п.</b>'
+        pct = f'{sign}{diff / old * 100:.1f}%' if old else '— (нульова база)'
+        return f'{color} <b>{sign}{fmt(diff)} ({pct})</b>'
+
+    old = calculate(previous_dates, store)
+    new = calculate(current_dates, store)
+    lines = [
+        f'📊 {title} | ТИЖДЕНЬ ДО ТИЖНЯ',
+        f'🏬 {html.escape(store) if store else "Весь регіон"}',
         f'📅 Минулий: {previous_dates[0]:%d.%m}–{previous_dates[-1]:%d.%m.%Y}',
         f'📅 Поточний: {current_dates[0]:%d.%m}–{current_dates[-1]:%d.%m.%Y}',
-        f'Однакові дні: {n} (без сьогодні)', '',
-        f'Минулий тиждень: {money(old_total)} $',
-        f'Поточний тиждень: {money(new_total)} $',
-        f'Різниця: {"🟢" if delta>0 else "🔴" if delta<0 else "⚪"} <b>{sign(delta)}{money(delta)} $ ({change_str(change)})</b>',
-        '', '🏬 ПО МАГАЗИНАХ (мин. → поточн. | Δ $ | Δ %)'
+        f'Однакові завершені дні: {n}', '',
+        f'Минулий тиждень: {fmt(old)}',
+        f'Поточний тиждень: {fmt(new)}',
+        'Зміна: ' + delta_line(old, new)
     ]
-    for store in STORE_ORDER:
-        a=float(old.loc[store]); b=float(new.loc[store]); diff=b-a
-        percent=(diff/a*100) if a else None
-        label=store.replace('Київ-','')
-        indicator = '🟢' if diff > 0 else '🔴' if diff < 0 else '⚪'
-        lines.append(f'{indicator} {html.escape(label)}: {money(a)} → {money(b)} $ | <b>{sign(diff)}{money(diff)} $ | {change_str(percent)}</b>')
+    if not store:
+        lines += ['', '🏬 ПО МАГАЗИНАХ (минулий → поточний | зміна)']
+        for name in STORE_ORDER:
+            a, b = calculate(previous_dates, name), calculate(current_dates, name)
+            lines.append(f'{html.escape(name.replace("Київ-", ""))}: {fmt(a)} → {fmt(b)} | {delta_line(a,b)}')
+    if metric == "conversion":
+        lines += ['', 'КОП = чеки / (трафік − PUDO) × 100. Зміна у відсоткових пунктах.']
+    if metric in ("average", "ktc"):
+        lines += ['', 'Показник розрахований з підсумкових чеків за період (не середнє денних значень).']
     return '\n'.join(lines)
 
+
+def wow_metric_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton('🛠 Послуги', callback_data='wm:services'),
+         InlineKeyboardButton('🎧 Аксесуари', callback_data='wm:accessories')],
+        [InlineKeyboardButton('💵 Прямі', callback_data='wm:direct'),
+         InlineKeyboardButton('💰 Загальний оборот', callback_data='wm:sales')],
+        [InlineKeyboardButton('📦 Пікап', callback_data='wm:pickup'),
+         InlineKeyboardButton('📊 КОП', callback_data='wm:conversion')],
+        [InlineKeyboardButton('🧾 КТЧ', callback_data='wm:ktc'),
+         InlineKeyboardButton('🛒 Середній чек', callback_data='wm:average')],
+    ])
 
 
 async def wow_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
     if update.effective_chat.type != 'private':
-        await update.effective_message.reply_text('🔒 Порівняння доступне лише в особистому чаті.')
+        await update.effective_message.reply_text('🔒 Доступно лише в особистому чаті.')
         return
     await update.effective_message.reply_text(
-        '📊 ТИЖДЕНЬ ДО ТИЖНЯ\\nЩо хочеш порівняти?',
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton('💵 Прямі продажі', callback_data='wow:direct')],
-            [InlineKeyboardButton('🎧 Аксесуари', callback_data='wow:accessories')],
-            [InlineKeyboardButton('🛠 Послуги', callback_data='wow:services')],
-        ]),
+        '📊 ТИЖДЕНЬ ДО ТИЖНЯ\nОберіть показник:',
+        reply_markup=wow_metric_keyboard()
     )
 
 
 async def wow_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query=update.callback_query
+    query = update.callback_query
     if not is_owner(update):
         await query.answer('Немає доступу.', show_alert=True)
         return
     if update.effective_chat.type != 'private':
         await query.answer('Тільки в особистому чаті.', show_alert=True)
         return
-    metric=query.data.split(':',1)[1]
-    if metric not in ('direct','accessories','services'):
-        await query.answer('Невідомий показник.', show_alert=True)
+    data = query.data
+    if data.startswith('wm:'):
+        metric = data.split(':', 1)[1]
+        if metric not in WOW_METRICS:
+            await query.answer('Невідомий показник.')
+            return
+        context.user_data['wow_metric'] = metric
+        buttons = [[InlineKeyboardButton('🌍 Весь регіон', callback_data='ws:all')]]
+        buttons += [[InlineKeyboardButton(name.replace('Київ-', ''), callback_data=f'ws:{i}')]
+                    for i, name in enumerate(STORE_ORDER)]
+        buttons.append([InlineKeyboardButton('⬅️ Інший показник', callback_data='ws:back')])
+        await query.answer()
+        await query.edit_message_text(
+            f'📊 {WOW_METRICS[metric][0]}\nОберіть регіон або магазин:',
+            reply_markup=InlineKeyboardMarkup(buttons))
         return
+    if not data.startswith('ws:'):
+        await query.answer()
+        return
+    choice = data.split(':', 1)[1]
     await query.answer()
+    if choice == 'back':
+        await query.edit_message_text('📊 ТИЖДЕНЬ ДО ТИЖНЯ\nОберіть показник:',
+                                      reply_markup=wow_metric_keyboard())
+        return
+    metric = context.user_data.get('wow_metric')
+    if metric not in WOW_METRICS:
+        await query.message.reply_text('Спочатку виберіть показник через /wow.')
+        return
+    if choice == 'all':
+        store = None
+    elif choice.isdigit() and int(choice) < len(STORE_ORDER):
+        store = STORE_ORDER[int(choice)]
+    else:
+        await query.message.reply_text('Невідомий магазин.')
+        return
     try:
-        report=await asyncio.to_thread(weekly_metric_comparison, metric)
+        report = await asyncio.to_thread(weekly_metric_comparison, metric, store)
         await query.message.reply_text(report, parse_mode='HTML')
     except Exception as exc:
         log.exception('Weekly metric comparison failed: %s', metric)
@@ -1739,7 +1824,7 @@ async def wow_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def setup_commands(app):
     await app.bot.set_my_commands([
         BotCommand("focus", "🎯 Фокуси + категорії"),
-        BotCommand("wow", "Порівняти прямі, аксесуари або послуги"),
+        BotCommand("wow", "8 показників: тиждень до тижня"),
         BotCommand("direct_wow", "Вибір порівняння тиждень до тижня"),
         BotCommand("group_test", "Тест відправки у групу"),
         BotCommand("interim_test", "Тест проміжкового звіту 1С"),
@@ -2869,7 +2954,7 @@ def main():
     )
     app.add_handler(CommandHandler("wow", wow_menu))
     app.add_handler(CommandHandler("direct_wow", wow_menu))
-    app.add_handler(CallbackQueryHandler(wow_choice, pattern=r"^wow:(direct|accessories|services)$"))
+    app.add_handler(CallbackQueryHandler(wow_choice, pattern=r"^(wm:(services|accessories|direct|sales|pickup|conversion|ktc|average)|ws:(all|back|[0-9]+))$"))
     app.add_handler(CommandHandler("test", private_test_menu))
     app.add_handler(CallbackQueryHandler(private_test_selected, pattern=r"^private_test:(day|month|week|interim)$"))
     app.add_handler(CommandHandler("group_here", group_here))
