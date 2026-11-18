@@ -1967,9 +1967,6 @@ def digest_dashboard(day):
         y=690+i*54
         if i%2==0: rect(30,y,1670,y+52,'#eef5fd',5)
         txt(43,y+13,short.get(store,store),21,navy,True)
-        if show_missing and store not in data:
-            txt(760,y+13,"НЕМАЄ ДАНИХ",22,"#b63f62",True)
-            continue
         for k,xp,xf,xe,xs in (('sales',380,500,556,None),
                                ('accessories',786,905,973,1160),
                                ('services',1280,1390,1458,1650)):
@@ -1998,7 +1995,7 @@ def digest_dashboard(day):
     txt(50,1551,'↑ ТОП-3  •  ОБОРОТ',29,'#07854e',True)
     txt(885,1551,'↓ АНТИТОП-3  •  ОБОРОТ',29,'#c82e43',True)
     ranking=[(store,perf(vals['sales'],plan['sales']),vals['sales']) for store,vals,plan in results]
-    ranking=[v for v in ranking if v[1] is not None and (not show_missing or v[0] in data)]
+    ranking=[v for v in ranking if v[1] is not None]
     ranking.sort(key=lambda z:z[1],reverse=True)
     for x,group in ((50,ranking[:3]),(870,list(reversed(ranking[-3:])))):
         for i,(store,pc,actual) in enumerate(group):
