@@ -2955,7 +2955,16 @@ CATEGORY_SOURCES = {'Прямая продажа':'direct','Заказ мага�
 CAT_NS = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
 
 def category_db():
-    conn=sqlite3.connect(DB_PATH, timeout=30)
+    # Create the database directory just as the existing db() helper does.
+    # Keep the configured DB_PATH; never silently switch to ephemeral storage.
+    try:
+        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(f"Немає доступу до папки бази {Path(DB_PATH).parent}: {exc}. Перевір Railway Volume та DB_PATH.") from exc
+    try:
+        conn=sqlite3.connect(DB_PATH, timeout=30)
+    except sqlite3.OperationalError as exc:
+        raise RuntimeError(f"Не вдалося відкрити SQLite за шляхом {DB_PATH}: {exc}. Перевір Railway Volume та DB_PATH.") from exc
     conn.execute('''CREATE TABLE IF NOT EXISTS category_sales (
        year INTEGER, month INTEGER, week INTEGER, store TEXT, category TEXT,
        subcategory TEXT, itemgroup TEXT, source TEXT, amount REAL,
