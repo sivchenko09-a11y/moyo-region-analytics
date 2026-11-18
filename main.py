@@ -2322,8 +2322,9 @@ def parse_interim_rows(rows, report_day):
         data[name] = {'sales': _interim_number(row[1] if len(row)>1 else None),
                       'accessories': _interim_number(row[2] if len(row)>2 else None),
                       'services': _interim_number(row[3] if len(row)>3 else None)}
-    if not data:
-        raise ValueError('Не знайдено жодного підсумкового рядка магазину.')
+    if set(data) != set(STORE_ORDER):
+        missing = sorted(set(STORE_ORDER) - set(data))
+        raise ValueError('Неповні дані 1С: відсутні магазини: ' + ', '.join(missing))
     # Hash of meaningful source values, independent of receipt count and cell formatting.
     canonical = json.dumps({'rate': rate, 'stores': data}, sort_keys=True, ensure_ascii=False)
     signature = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
@@ -2350,7 +2351,7 @@ def fetch_interim_sheet(report_day):
         response.raise_for_status()
         return parse_interim_rows(response.json().get('values', []), report_day)
 
-def interim_dashboard(report_day, slot, rate, data):
+def interim_dashboard(report_day, slot, rate, data, detected_at=None):
     """Render the approved dense MOYO dashboard: grouped plan/fact/%/share columns."""
     from PIL import Image, ImageDraw, ImageFont
     from matplotlib import font_manager
@@ -2390,7 +2391,7 @@ def interim_dashboard(report_day, slot, rate, data):
     txt(40,27,'MOYO  |  ПРОМІЖКОВИЙ ЗВІТ',46,'white',True)
     txt(42,91,'РЕГІОН — ЦЕНТР    •    ДЕНЬ В ДЕНЬ',23,'#c7e1fa')
     txt(W-36,33,report_day.strftime('%d.%m.%Y'),29,'white',True,'ra')
-    txt(W-36,80,f'Після {slot}:00   |   Курс {rate:g} грн/$',23,'#dcecff',True,'ra')
+    txt(W-36,80,f'Дані виявлено: {(detected_at or datetime.now(REPORT_TZ)):%H:%M}   |   Курс {rate:g} грн/$',21,'#dcecff',True,'ra')
     cards=[('ОБОРОТ','sales','#216dc4'),('АКСЕСУАРИ','accessories','#0e9962'),('ПОСЛУГИ','services','#b63f62')]
     cw=(W-56)//3
     for i,(label,k,accent) in enumerate(cards):
@@ -2529,8 +2530,9 @@ async def interim_test(update, context):
         await context.bot.send_photo(
             chat_id=chat_id,
             photo=picture,
-            caption=f"🧪 ТЕСТ • МОЙО — проміжковий звіт за {day:%d.%m.%Y} "
-                    f"(курс {rate:g} грн/$). Автоматичні відправки не змінено."
+            caption=f"🧪 ТЕСТ • МОЙО — {day:%d.%m.%Y}\n"
+                    f"🕒 Дані перевірено: {datetime.now(REPORT_TZ):%H:%M} (Київ)\n"
+                    f"Курс {rate:g} грн/$. Автоматичні відправки не змінено."
         )
     except Exception as exc:
         log.exception("Manual interim test failed")
@@ -2540,71 +2542,69 @@ async def interim_test(update, context):
         )
 
 
+def interim_watch_db():
+    conn = db()
+    conn.execute("""CREATE TABLE IF NOT EXISTS interim_watch_state (
+        chat_id TEXT NOT NULL, day TEXT NOT NULL, signature TEXT NOT NULL,
+        detected_at TEXT, sent_at TEXT, PRIMARY KEY(chat_id, day))""")
+    return conn
+
+
 async def interim_loop(app):
-    """Send only after a change observed during this process, never on Railway restart."""
-    baseline = None
+    """Publish each stable changed 1C snapshot; persist baseline across Railway restarts."""
     pending = None
-    last_slot = None
     while True:
         await asyncio.sleep(60)
         if not GROUP_CHAT_ID:
             continue
         now = datetime.now(REPORT_TZ)
-        slot = 21 if now.hour >= 21 else 18 if now.hour >= 18 else 15 if now.hour >= 15 else None
-        if slot is None:
-            pending = None
-            continue
         day = now.date()
-        conn = interim_db()
-        try:
-            already = conn.execute(
-                'SELECT signature FROM interim_sent WHERE day=? AND slot=? AND chat_id=?',
-                (day.isoformat(), slot, str(GROUP_CHAT_ID))).fetchone()
-            earlier = conn.execute(
-                'SELECT signature FROM interim_sent WHERE day=? AND slot=? AND chat_id=?',
-                (day.isoformat(), 15 if slot == 18 else 18, str(GROUP_CHAT_ID))
-            ).fetchone() if slot in (18, 21) else None
-            if slot == 21 and not earlier:
-                earlier = conn.execute(
-                    'SELECT signature FROM interim_sent WHERE day=? AND slot=15 AND chat_id=?',
-                    (day.isoformat(), str(GROUP_CHAT_ID))).fetchone()
-        finally:
-            conn.close()
-        if already:
-            continue
+        day_key = day.isoformat()
+        chat_key = str(GROUP_CHAT_ID)
         try:
             rate, data, signature = await asyncio.to_thread(fetch_interim_sheet, day)
-            # First successful observation after startup is a baseline, not a new upload.
-            # This avoids replaying existing Sheets data after every Railway deployment.
-            if baseline is None or baseline[0] != day.isoformat():
-                baseline = (day.isoformat(), signature)
-                pending = None
-                log.info('Interim watcher baseline initialized for %s; no startup send', day)
-                continue
-            if earlier and earlier[0] == signature:
-                pending = None
-                continue
-            if signature == baseline[1]:
-                pending = None
-                continue
-            key = (day.isoformat(), slot, signature)
-            if pending != key:
-                pending = key
-                continue  # Require unchanged data at two consecutive polls.
-            # Do not publish incomplete reports: all 14 stores need 3 valid plans.
-            await asyncio.to_thread(refresh_interim_plans, day)
-            picture = await asyncio.to_thread(interim_dashboard, day, slot, rate, data)
-            await app.bot.send_photo(
-                chat_id=int(GROUP_CHAT_ID), photo=picture,
-                caption=f'📊 МОЙО — проміжковий звіт за {day:%d.%m.%Y} (після {slot}:00)')
-            conn = interim_db()
+            conn = interim_watch_db()
             try:
-                with conn:
-                    conn.execute('INSERT OR REPLACE INTO interim_sent VALUES (?,?,?,?)',
-                                 (day.isoformat(), slot, str(GROUP_CHAT_ID), signature))
+                saved = conn.execute(
+                    'SELECT signature FROM interim_watch_state WHERE chat_id=? AND day=?',
+                    (chat_key, day_key)).fetchone()
+                if saved is None:
+                    # Initial observation is not evidence of a new upload.
+                    # Persist it so that a subsequent restart cannot reset the baseline.
+                    with conn:
+                        conn.execute('INSERT INTO interim_watch_state (chat_id,day,signature) VALUES (?,?,?)',
+                                     (chat_key, day_key, signature))
+                    pending = None
+                    log.info('Interim baseline persisted for %s; waiting for changed 1C figures', day_key)
+                    continue
             finally:
                 conn.close()
-            baseline = (day.isoformat(), signature)
+            if saved[0] == signature:
+                pending = None
+                continue
+            key = (day_key, signature)
+            if pending is None or pending[0] != key:
+                pending = (key, now)
+                continue  # Require two consecutive identical snapshots.
+            detected_at = pending[1]
+            await asyncio.to_thread(refresh_interim_plans, day)
+            picture = await asyncio.to_thread(interim_dashboard, day, now.hour, rate, data, detected_at)
+            sent_at = datetime.now(REPORT_TZ)
+            await app.bot.send_photo(
+                chat_id=int(GROUP_CHAT_ID), photo=picture,
+                caption=(f'📊 МОЙО ЦЕНТР | ПРОМІЖКОВИЙ ЗВІТ 1С\n'
+                         f'📅 Дата: {day:%d.%m.%Y}\n'
+                         f'🕒 Нові дані виявлено: {detected_at:%H:%M} (Київ)\n'
+                         f'📤 Відправлено: {sent_at:%H:%M} (Київ)'))
+            conn = interim_watch_db()
+            try:
+                with conn:
+                    conn.execute('UPDATE interim_watch_state SET signature=?,detected_at=?,sent_at=? '
+                                 'WHERE chat_id=? AND day=?',
+                                 (signature, detected_at.isoformat(), sent_at.isoformat(), chat_key, day_key))
+            finally:
+                conn.close()
+            log.info('Interim report delivered for %s; change detected at %s', day_key, detected_at.isoformat())
             pending = None
         except Exception:
             log.exception('Interim report poll failed; will retry')
