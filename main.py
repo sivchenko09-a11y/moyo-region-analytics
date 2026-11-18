@@ -2472,7 +2472,13 @@ def interim_dashboard(report_day, slot, rate, data, detected_at=None, show_missi
         if i%2==0: rect(30,y,1670,y+rowh-2,'#eef5fd',5)
         txt(43,y+13,short.get(store,store),21,navy,True)
         if show_missing and store not in data:
-            txt(760,y+13,"НЕМАЄ ДАНИХ",22,"#b63f62",True)
+            # Monthly plan is independent of whether 1C has reported any sales.
+            # Preserve missingness: do not show zero facts or 0% completion.
+            for k,xp in (('sales',380),('accessories',786),('services',1280)):
+                txt(xp,y+14,money(plan[k]) if plan[k] is not None else '—',19,muted,False,'ra')
+            txt(465,y+14,"Немає даних",16,"#b63f62",True)
+            txt(905,y+14,"—",19,muted,False,'ra')
+            txt(1390,y+14,"—",19,muted,False,'ra')
             continue
         for k,xp,xf,xe,xs in (('sales',380,500,556,None),('accessories',786,905,973,1160),('services',1280,1390,1458,1650)):
             pp=perf(vals[k],plan[k]); share=100*vals[k]/vals['sales'] if vals['sales'] else 0
