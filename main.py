@@ -3442,7 +3442,7 @@ def _forecast_action(parts):
 def _forecast_risk_action(parts):
     name=(parts[-1] if parts else '').casefold()
     if any(x in name for x in ('playstation','ps5','ps4','консол','xbox','nintendo','приставк')):
-        return ('Звірити наявність і ціни консолей та геймпадів із минулим груднем; '
+        return ('Звірити наявність і ціни консолей та геймпадів за аналогічний період 2025 року; '
                 'директорам провести 15-хвилинне навчання з комплекту «консоль + гра + другий геймпад».')
     if 'iphone' in name or 'айфон' in name:
         return ('Перевірити наявність ходових моделей iPhone, обсягів пам’яті та причини втрати продажів; '
@@ -3624,6 +3624,23 @@ def _forecast_report(path,store,source,mode):
         risk_sum=sum(r[2]-r[1] for r in risks[:3])
         growth_sum=sum(r[1]-r[2] for r in growth[:2])
         lines.append(f'\n⚖️ Орієнтир: приріст двох груп можливостей +{number(growth_sum)} $ проти ризику трьох груп −{number(risk_sum)} $ до 2025 року. Це порівняння прогнозів, а не гарантована компенсація.')
+    # Store-level opportunities are relevant only for the region-wide report.
+    if store is None:
+        try:
+            opportunities=_forecast_store_opportunities(path,source,period,historical,recent,prior,minimum)
+            lines.append('\n🏬 МАГАЗИНИ З ПОТЕНЦІАЛОМ ЗРОСТАННЯ')
+            if opportunities:
+                for shop,gain,best in opportunities[:3]:
+                    _,parts,pred,py,delta=best
+                    lines.append(
+                        f'🟢 {shop} — {parts[-1]}: {number(pred)} $ проти '
+                        f'{number(py)} $ торік (+{number(delta)} $).\n'
+                        f'   🎯 {_forecast_action(parts).capitalize()}.')
+            else:
+                lines.append('За наявною історією підтверджених прогнозованих приростів по магазинах немає.')
+        except (sqlite3.Error, ValueError, TypeError) as exc:
+            log.exception('Store opportunity forecast failed: %s', exc)
+            lines.append('🏬 Потенціал магазинів тимчасово недоступний.')
     return '\n'.join(lines)
 
 
