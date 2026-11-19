@@ -1741,6 +1741,21 @@ def weekly_metric_comparison(metric="direct", store=None, as_of=None):
         lines += ['', 'КОП = чеки / (трафік − PUDO) × 100. Зміна у відсоткових пунктах.']
     if metric in ("average", "ktc"):
         lines += ['', 'Показник розрахований з підсумкових чеків за період (не середнє денних значень).']
+    if not store:
+        opportunities=_forecast_store_opportunities(
+            path,source,period,historical,recent,prior,
+            max(30,minimum/2))
+        lines.append('\n🏬 МАГАЗИНИ З ПОТЕНЦІАЛОМ ЗРОСТАННЯ')
+        if opportunities:
+            for shop,gain,best in opportunities[:5]:
+                _,parts,pred,py,delta=best
+                lines.append(
+                    f'🟢 {shop}: {parts[-1]} — прогноз {number(pred)} $ '
+                    f'проти {number(py)} $ торік (+{number(delta)} $). '
+                    f'Дія: '+_forecast_action(parts))
+        else:
+            lines.append('За наявною історією немає магазинів із достатньо '
+                         'підтвердженим прогнозованим приростом до 2025 року.')
     return '\n'.join(lines)
 
 
@@ -3402,10 +3417,14 @@ def _forecast_product_signals(path, store, source, period, historical, recent, p
 
 
 def _forecast_action(parts):
-    name=' / '.join(parts[2:] if len(parts)>2 else parts)
+    name=parts[-1] if parts else ''
     low=name.casefold()
     if any(x in low for x in ('playstation','ps5','ps4','консол','xbox','nintendo')):
         return 'перевірити залишки консолей, геймпадів та ігор; директорам провести коротке навчання з комплектних продажів'
+    if 'tecno' in low or 'текно' in low:
+        return 'перевірити доступність ходових моделей Tecno; навчити продавців порівнювати їх з аналогами у бюджетному сегменті'
+    if 'samsung' in low or 'самсунг' in low:
+        return 'перевірити запас популярних Samsung; провести навчання з порівняння моделей і комплектів із захистом'
     if any(x in low for x in ('iphone','смартфон','телефон')):
         return 'перевірити доступність популярних моделей і пам\'яті; відпрацювати комплекти з аксесуарами та послугами'
     if any(x in low for x in ('ноутбук','macbook','laptop')):
@@ -3421,13 +3440,22 @@ def _forecast_action(parts):
 
 
 def _forecast_risk_action(parts):
-    name=' / '.join(parts[2:] if len(parts)>2 else parts).casefold()
+    name=(parts[-1] if parts else '').casefold()
     if any(x in name for x in ('playstation','ps5','ps4','консол','xbox','nintendo','приставк')):
         return ('Звірити наявність і ціни консолей та геймпадів із минулим груднем; '
                 'директорам провести 15-хвилинне навчання з комплекту «консоль + гра + другий геймпад».')
-    if any(x in name for x in ('iphone','смартфон','телефон')):
+    if 'iphone' in name or 'айфон' in name:
         return ('Перевірити наявність ходових моделей iPhone, обсягів пам’яті та причини втрати продажів; '
                 'директорам відпрацювати альтернативи за бюджетом і комплекти із захистом та послугами.')
+    if any(x in name for x in ('tecno','текно')):
+        return ('Звірити наявність моделей Tecno у бюджетному сегменті та ціни конкурентів; '
+                'директорам відпрацювати презентацію переваг Tecno й порівняння з альтернативами того самого бюджету.')
+    if any(x in name for x in ('samsung','самсунг')):
+        return ('Перевірити наявність ходових моделей Samsung і причини відставання; '
+                'директорам відпрацювати підбір моделей за бюджетом та допродаж захисту й послуг.')
+    if any(x in name for x in ('смартфон','телефон')):
+        return ('Перевірити доступність смартфонів відповідного сегмента та причини відставання; '
+                'директорам відпрацювати порівняння моделей, гарантійні умови й комплектні продажі.')
     if any(x in name for x in ('планшет','tablet','ipad')):
         return ('Перевірити наявність планшетів у ключових цінових сегментах; '
                 'директорам провести коротке навчання зі сценаріїв використання та допродажу чохлів і стилусів.')
@@ -3448,6 +3476,49 @@ def _forecast_risk_action(parts):
                 'директорам відпрацювати пропозицію кронштейна, доставки й налаштування.')
     return ('Звірити асортимент і наявність основних позицій із минулим роком; '
             'директорам визначити причини відставання та провести коротке навчання з підбору альтернатив.')
+
+
+def _forecast_store_opportunities(path, source, period, historical, recent, prior, minimum):
+    """Rank store+product signals by projected positive YoY; not inventory availability."""
+    conn=category_db()
+    try:
+        clauses=['1=1'];params=[]
+        if source!='all':
+            clauses.append('source=?');params.append(source)
+        for column,value in zip(('category','subcategory','itemgroup','brand'),path):
+            clauses.append(column+'=?');params.append(value)
+        sql=('SELECT store,year,'+period+',category,subcategory,itemgroup,brand,SUM(amount) '
+             'FROM category_sales_v2 WHERE '+' AND '.join(clauses)+
+             ' GROUP BY store,year,'+period+',category,subcategory,itemgroup,brand')
+        rows=conn.execute(sql,params).fetchall()
+    finally:
+        conn.close()
+    series=defaultdict(lambda:defaultdict(float))
+    for store,y,p,cat,sub,group,brand,amount in rows:
+        parts=tuple(x for x in (cat,sub,group,brand) if x)
+        if len(parts)<3 or not store:continue
+        series[(store,parts)][(int(y),int(p))]+=float(amount)
+    candidates=[]
+    for (store,parts),v in series.items():
+        old=sum(v.get(k,0) for k in prior)/3
+        recent_avg=sum(v.get(k,0) for k in recent)/3
+        if old<minimum or recent_avg<minimum:continue
+        py=v.get(historical,0)
+        if py<=0:continue
+        factor=max(.5,min(1.75,py/old))
+        pred=recent_avg*factor
+        gain=pred-py
+        if gain<=max(minimum,py*.08):continue
+        candidates.append((store,parts,pred,py,gain))
+    # One strongest opportunity per store, then rank stores by their
+    # overall positive opportunities. This avoids listing the same store repeatedly.
+    by_store=defaultdict(list)
+    for item in candidates:by_store[item[0]].append(item)
+    ranked=[]
+    for store,items in by_store.items():
+        items.sort(key=lambda r:r[4],reverse=True)
+        ranked.append((store,items[0][4],items[0]))
+    return sorted(ranked,key=lambda r:r[1],reverse=True)
 
 def _forecast_report(path,store,source,mode):
     today=datetime.now(REPORT_TZ).date()
@@ -3505,34 +3576,54 @@ def _forecast_report(path,store,source,mode):
             change=f'{(pred/py-1)*100:+.0f}%' if py else 'без бази'
             lines.append(f'{"🟢" if pred>=py else "🔴"} {name}: {number(pred)} $ ({change} до 2025)')
     signals=_forecast_product_signals(path,store,source,period,historical,recent,prior,minimum)
-    # Rank by both seasonal opportunity and material downside. Do not present
-    # a forecast as observed demand, or recommend extra stock solely on YoY.
+    # Separate downside risks from credible growth opportunities. Each group
+    # must be a distinct leaf; never label a negative YoY forecast as growth.
     threshold=max(minimum*2,total*.005)
     qualified=[r for r in signals if r[1]>=threshold or r[2]>=threshold]
-    qualified.sort(key=lambda r:(abs(r[1]-r[2]),max(r[1],r[2])),reverse=True)
-    if qualified:
-        lines.append('\n📦 ТОВАРНІ ГРУПИ — ПРОГНОЗ І ДІЇ')
-        shown=set();count=0
-        for parts,pred,py,applied,base,actual in qualified:
-            name=parts[-1]
-            if name in shown:continue
-            shown.add(name);count+=1
-            change=f'{(pred/py-1)*100:+.1f}%' if py else 'немає бази 2025'
-            october=actual.get((today.year,10),0)
-            november=actual.get((today.year,11),0)
-            lines.append(f'\n{count}. {name}\n'
+    risks=sorted((r for r in qualified if r[2]>0 and r[1]<r[2]*.8),
+                 key=lambda r:(r[2]-r[1],r[2]),reverse=True)
+    growth=sorted((r for r in qualified if r[2]>0 and r[1]>r[2]*1.08 and r[3]>1.05),
+                  key=lambda r:(r[1]-r[2],r[1]),reverse=True)
+    # Newly appearing groups lack a 2025 comparison and should not be called
+    # growth without evidence; keep them outside the growth shortlist.
+    def group_line(r,numbering,kind):
+        parts,pred,py,applied,base,actual=r
+        name=parts[-1]
+        change=f'{(pred/py-1)*100:+.1f}%' if py else 'немає бази 2025'
+        october=actual.get((today.year,10),0)
+        november=actual.get((today.year,11),0)
+        result=(f'\n{numbering}. {name}\n'
                 f'   Жовтень 2026: {number(october)} $\n'
                 f'   Листопад 2026: {number(november)} $ (доступний зріз)\n'
                 f'   Прогноз {title}: {number(pred)} $\n'
                 f'   Аналогічний період 2025: {number(py)} $ ({change})')
-            if pred>py*1.08 and applied>1.05:
-                action=_forecast_action(parts)
-                lines.append('   🎯 Можливе зростання: '+action+'. Запас збільшувати лише після перевірки поточних продажів і залишків.')
-            elif py and pred<py*.8:
-                lines.append('   🎯 Ризик відставання: '+_forecast_risk_action(parts))
-            else:
-                lines.append('   🎯 Перевірити наявність ходових позицій і готовність продавців до комплектних продажів.')
-            if count>=5:break
+        if kind=='risk':
+            result+='\n   🎯 Ризик відставання: '+_forecast_risk_action(parts)
+        else:
+            result+='\n   🎯 Можливість посилення: '+_forecast_action(parts)+'. Збільшувати запас лише після перевірки попиту та залишків.'
+        return result
+    if risks:
+        lines.append('\n🔴 РИЗИКИ — ЩО ПОТРЕБУЄ УВАГИ')
+        seen=set();n=0
+        for r in risks:
+            if r[0] in seen:continue
+            seen.add(r[0]);n+=1
+            lines.append(group_line(r,n,'risk'))
+            if n>=3:break
+    if growth:
+        lines.append('\n🟢 МОЖЛИВОСТІ — НА ЧОМУ ПОСИЛИТИ АКЦЕНТ')
+        seen=set();n=0
+        for r in growth:
+            if r[0] in seen:continue
+            seen.add(r[0]);n+=1
+            lines.append(group_line(r,n,'growth'))
+            if n>=2:break
+    else:
+        lines.append('\n🟢 МОЖЛИВОСТІ\nПідтверджених моделлю груп зі зростанням до 2025 року немає. Не пропоную компенсувати падіння без даних.')
+    if risks and growth:
+        risk_sum=sum(r[2]-r[1] for r in risks[:3])
+        growth_sum=sum(r[1]-r[2] for r in growth[:2])
+        lines.append(f'\n⚖️ Орієнтир: приріст двох груп можливостей +{number(growth_sum)} $ проти ризику трьох груп −{number(risk_sum)} $ до 2025 року. Це порівняння прогнозів, а не гарантована компенсація.')
     return '\n'.join(lines)
 
 
