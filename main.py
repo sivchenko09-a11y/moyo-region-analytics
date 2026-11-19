@@ -3361,9 +3361,65 @@ def _forecast_period_data(path, store, source, period):
         series[name][(int(y),int(p))]=float(amount)
     return series,available,child
 
+def _forecast_product_signals(path, store, source, period, historical, recent, prior, minimum):
+    """Leaf-level product signals with separately labelled October/November actuals."""
+    conn=category_db()
+    try:
+        clauses=['1=1'];params=[]
+        if store:clauses.append('store=?');params.append(store)
+        if source!='all':clauses.append('source=?');params.append(source)
+        for column,value in zip(('category','subcategory','itemgroup','brand'),path):
+            clauses.append(column+'=?');params.append(value)
+        sql=('SELECT year,'+period+',category,subcategory,itemgroup,brand,SUM(amount) '
+             'FROM category_sales_v2 WHERE '+' AND '.join(clauses)+
+             ' GROUP BY year,'+period+',category,subcategory,itemgroup,brand')
+        rows=conn.execute(sql,params).fetchall()
+        # Monthly actuals must be queried independently, even for a weekly forecast.
+        actual_rows=conn.execute('SELECT year,month,category,subcategory,itemgroup,brand,SUM(amount) '
+            'FROM category_sales_v2 WHERE '+' AND '.join(clauses)+
+            ' GROUP BY year,month,category,subcategory,itemgroup,brand',params).fetchall()
+    finally:conn.close()
+    values=defaultdict(lambda:defaultdict(float))
+    actuals=defaultdict(lambda:defaultdict(float))
+    for y,p,cat,sub,group,brand,amount in rows:
+        parts=tuple(x for x in (cat,sub,group,brand) if x)
+        if len(parts)<3:continue
+        values[parts][(int(y),int(p))]+=float(amount)
+    for y,m,cat,sub,group,brand,amount in actual_rows:
+        parts=tuple(x for x in (cat,sub,group,brand) if x)
+        if len(parts)<3:continue
+        actuals[parts][(int(y),int(m))]+=float(amount)
+    results=[]
+    for parts,series in values.items():
+        old_base=sum(series.get(k,0) for k in prior)/3
+        current_base=sum(series.get(k,0) for k in recent)/3
+        if old_base<minimum or current_base<minimum:continue
+        py=series.get(historical,0)
+        applied=max(.5,min(1.75,py/old_base))
+        estimate=current_base*applied
+        results.append((parts,estimate,py,applied,current_base,actuals[parts]))
+    return results
+
+
+def _forecast_action(parts):
+    name=' / '.join(parts[2:] if len(parts)>2 else parts)
+    low=name.casefold()
+    if any(x in low for x in ('playstation','ps5','ps4','консол','xbox','nintendo')):
+        return 'перевірити залишки консолей, геймпадів та ігор; директорам провести коротке навчання з комплектних продажів'
+    if any(x in low for x in ('iphone','смартфон','телефон')):
+        return 'перевірити доступність популярних моделей і пам\'яті; відпрацювати комплекти з аксесуарами та послугами'
+    if any(x in low for x in ('ноутбук','macbook','laptop')):
+        return 'перевірити наявність основних конфігурацій; провести 15-хвилинне навчання з підбору та допродажу'
+    if any(x in low for x in ('навушник','гарнитур','акустик')):
+        return 'перевірити залишки та демозразки; відпрацювати демонстрацію і парний продаж'
+    if any(x in low for x in ('аккумулятор','power bank','заряд','павербанк')):
+        return 'перевірити запас популярних ємностей і сумісність; підготувати готові комплекти'
+    if any(x in low for x in ('телевизор','тв','проектор')):
+        return 'перевірити ходові діагоналі та демонстрацію; відпрацювати пропозицію кронштейнів і підключення'
+    return 'перевірити залишки ходових позицій, доступність на полицях і провести коротке навчання продавців'
+
+
 def _forecast_report(path,store,source,mode):
-    from datetime import date
-    import calendar
     today=datetime.now(REPORT_TZ).date()
     if mode=='week':
         this_start=today-timedelta(days=today.weekday())
@@ -3375,10 +3431,9 @@ def _forecast_report(path,store,source,mode):
             d=target-timedelta(weeks=offset);iso=d.isocalendar()
             recent.append((iso.year,iso.week));prior.append((y-1,iso.week))
         current=(today.isocalendar().year,today.isocalendar().week)
-        # Pivot has only weekly totals, not daily sales; current week is NOT a verified as-of-today fact.
-        current_label=f'Поточний тиждень {current[1]} ({current[0]})'
-        target_label=f'тиждень {p} ({y}) | {target:%d.%m}–{target+timedelta(days=6):%d.%m.%Y}'
-        period='week'; minimum=30
+        period='week';minimum=30
+        title=f'{p}-й тиждень · {target:%d.%m}–{target+timedelta(days=6):%d.%m.%Y}'
+        current_title=f'{current[1]}-й тиждень'
     else:
         y,p=(today.year+1,1) if today.month==12 else (today.year,today.month+1)
         historical=(y-1,p)
@@ -3389,59 +3444,68 @@ def _forecast_report(path,store,source,mode):
             while mm<=0:yy-=1;mm+=12
             recent.append((yy,mm));prior.append((yy-1,mm))
         current=(today.year,today.month)
-        current_label=f'Поточний місяць {today:%m.%Y}'
-        target_label=f'місяць {p:02d}.{y}'
         period='month';minimum=100
+        title=f'{p:02d}.{y}'
+        current_title=f'{today:%m.%Y}'
     series,available,child=_forecast_period_data(path,store,source,period)
-    heading=(f'🔮 ПРОГНОЗ КАТЕГОРІЙ | {target_label}\n'
-             f'🏬 {store or "Весь регіон"}\n📂 {" → ".join(path) or "Усі категорії"}\n'
-             f'Джерело: {source}\n')
-    needed=[historical,*recent,*prior]
-    missing=[f'{v[0]}/{v[1]}' for v in needed if v not in available]
-    if missing:
-        return heading+'\n⚠️ Бракує історичних періодів: '+', '.join(dict.fromkeys(missing))+'. Онови /catsync.'
+    number=lambda v:f'{v:,.0f}'.replace(',',' ')
+    heading=f'🔮 ПРОГНОЗ ПРОДАЖІВ | {title}\n🏬 {store or "Весь регіон"} · {"Прямі" if source=="direct" else "Пікап" if source=="pickup" else "Усі джерела" if source=="all" else source}\n📂 {" → ".join(path) or "Усі категорії"}'
+    missing=[f'{v[0]}/{v[1]}' for v in [historical,*recent,*prior] if v not in available]
+    if missing:return heading+'\n⚠️ Бракує історії: '+', '.join(dict.fromkeys(missing))+'. Онови /catsync.'
     estimates=[]
     for name,values in series.items():
         base=sum(values.get(k,0) for k in prior)/3
         recent_avg=sum(values.get(k,0) for k in recent)/3
         last_year=values.get(historical,0)
         if base<minimum or recent_avg<minimum:continue
-        raw=last_year/base
-        applied=max(.5,min(1.75,raw))
-        prediction=recent_avg*applied
-        estimates.append((name,prediction,last_year,raw,applied))
+        applied=max(.5,min(1.75,last_year/base))
+        estimates.append((name,recent_avg*applied,last_year))
     if not estimates:return heading+'\n⚠️ Недостатньо історії для прогнозу.'
-    total=sum(v[1] for v in estimates)
-    total_py=sum(v[2] for v in estimates)
-    # The current pivot week/month can be partial, or reflect a future-filled template.
-    # Without dated daily facts, label it as the last imported period, not "as of today".
+    total=sum(r[1] for r in estimates)
+    total_py=sum(r[2] for r in estimates)
     current_values=sum(v.get(current,0) for v in series.values())
-    actual_status='наявний у Google Sheets зріз; дата останнього продажу невідома' if current in available else 'дані ще не завантажені'
-    number=lambda v:f'{v:,.0f}'.replace(',',' ')
-    yoy=(f'{(total/total_py-1)*100:+.1f}%' if total_py else '— (немає бази)')
-    lines=[heading,
-        f'📌 Прогноз груп із достатньою історією: {number(total)} $ (НЕ весь оборот)',
-        f'📅 Факт цих груп за аналогічний період торік: {number(total_py)} $',
-        f'📈 Прогноз до минулого року: {"+" if total>=total_py else ""}{number(total-total_py)} $ ({yoy})',
-        f'💵 {current_label}: {number(current_values)} $ — {actual_status}.',
-        '⚠️ Поточний факт — за ІНШИЙ період, ніж прогноз. Він не додається до прогнозу наступного тижня/місяця.',
-        '\nМетод: середнє 3 завершених періодів × сезонний індекс аналогічного періоду торік. '
-        'Застосований коефіцієнт 0,50–1,75×.']
+    yoy=f'{(total/total_py-1)*100:+.1f}%' if total_py else 'немає бази'
+    lines=[heading,'',f'📊 Прогноз: {number(total)} $*',
+        f'📅 Аналогічний період 2025: {number(total_py)} $',
+        f'📈 До минулого року: {"+" if total>=total_py else ""}{number(total-total_py)} $ ({yoy})',
+        f'💵 Факт {current_title}: {number(current_values)} $ (доступний зріз)']
     if child:
-        lines.append('\n📂 Прогноз за категоріями (прогноз | торік | зміна YoY):')
-        for name,pred,py,raw,applied in sorted(estimates,key=lambda r:r[1],reverse=True)[:12]:
-            delta=pred-py
-            change=f'{delta/py*100:+.1f}%' if py else 'нова база'
-            icon='🟢' if delta>0 else '🔴' if delta<0 else '⚪'
-            lines.append(f'{icon} {name}: {number(pred)} $ | {number(py)} $ | {"+" if delta>=0 else ""}{number(delta)} $ ({change}); сезонність {raw:.2f}× → застосовано {applied:.2f}×')
-        negatives=sorted((r for r in estimates if r[1]<r[2]),key=lambda r:r[1]-r[2])[:3]
-        positives=sorted((r for r in estimates if r[1]>r[2]),key=lambda r:r[1]-r[2],reverse=True)[:3]
-        if negatives:lines.append('\n🎯 Ризики: '+', '.join(r[0] for r in negatives)+'. Перевірити залишки, викладку, причини падіння та плани продажів.')
-        if positives:lines.append('📦 Можливе зростання: '+', '.join(r[0] for r in positives)+'. Підготувати товарні запаси й комплекти.')
-    else:lines.append('\n🎯 Перевірити залишки, викладку, комплекти та готовність продавців.')
-    lines.append('\n⚠️ Без урахування майбутніх акцій, поставок і цін. Прогноз — орієнтир, не план. '
-                 'Для точного факту станом на сьогодні потрібні щоденні дані, а не тижневий/місячний pivot.')
+        lines.append('\n📂 ОСНОВНІ КАТЕГОРІЇ')
+        for name,pred,py in sorted(estimates,key=lambda r:r[1],reverse=True)[:5]:
+            change=f'{(pred/py-1)*100:+.0f}%' if py else 'без бази'
+            lines.append(f'{"🟢" if pred>=py else "🔴"} {name}: {number(pred)} $ ({change} до 2025)')
+    signals=_forecast_product_signals(path,store,source,period,historical,recent,prior,minimum)
+    # Rank by both seasonal opportunity and material downside. Do not present
+    # a forecast as observed demand, or recommend extra stock solely on YoY.
+    threshold=max(minimum*2,total*.005)
+    qualified=[r for r in signals if r[1]>=threshold or r[2]>=threshold]
+    qualified.sort(key=lambda r:(abs(r[1]-r[2]),max(r[1],r[2])),reverse=True)
+    if qualified:
+        lines.append('\n📦 ТОВАРНІ ГРУПИ — ПРОГНОЗ І ДІЇ')
+        shown=set();count=0
+        for parts,pred,py,applied,base,actual in qualified:
+            name=parts[-1]
+            if name in shown:continue
+            shown.add(name);count+=1
+            change=f'{(pred/py-1)*100:+.1f}%' if py else 'немає бази 2025'
+            october=actual.get((today.year,10),0)
+            november=actual.get((today.year,11),0)
+            lines.append(f'\n{count}. {name}\n'
+                f'   Жовтень 2026: {number(october)} $\n'
+                f'   Листопад 2026: {number(november)} $ (доступний зріз)\n'
+                f'   Прогноз {title}: {number(pred)} $\n'
+                f'   Аналогічний період 2025: {number(py)} $ ({change})')
+            if pred>py*1.08 and applied>1.05:
+                action=_forecast_action(parts)
+                lines.append('   🎯 Можливе зростання: '+action+'. Запас збільшувати лише після перевірки поточних продажів і залишків.')
+            elif py and pred<py*.8:
+                lines.append('   🎯 Ризик відставання: перевірити асортимент, залишки й причини просідання. Директорам відпрацювати презентацію та комплектні продажі; запас без підтвердженого попиту не нарощувати.')
+            else:
+                lines.append('   🎯 Перевірити наявність ходових позицій і готовність продавців до комплектних продажів.')
+            if count>=5:break
+    lines.append('\n* Прогноз охоплює лише групи з достатньою історією. Факт листопада — доступний зріз Google Sheets без підтвердженої дати останнього продажу; він не є прогнозом грудня. Майбутні акції та залишки не враховано.')
     return '\n'.join(lines)
+
 
 def category_forecast_text(path,store,source):
     return _forecast_report(path,store,source,'week')
