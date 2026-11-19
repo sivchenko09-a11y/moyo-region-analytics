@@ -2780,14 +2780,16 @@ async def interim_test(update, context):
         )
         # Refresh monthly plans, so the image uses the newest plan figures.
         await asyncio.to_thread(refresh_interim_plans, day)
-        rate, data, _ = await asyncio.to_thread(fetch_interim_sheet, day)
+        rate, data, _ = await asyncio.to_thread(fetch_interim_sheet, day, True)
         slot = 21 if datetime.now(REPORT_TZ).hour >= 21 else 18 if datetime.now(REPORT_TZ).hour >= 18 else 15
-        picture = await asyncio.to_thread(interim_dashboard, day, slot, rate, data)
+        picture = await asyncio.to_thread(interim_dashboard, day, slot, rate, data, None, True)
         await context.bot.send_photo(
             chat_id=chat_id,
             photo=picture,
             caption=f"🧪 ТЕСТ • МОЙО — {day:%d.%m.%Y}\n"
                     f"🕒 Дані перевірено: {datetime.now(REPORT_TZ):%H:%M} (Київ)\n"
+                    f"Отримано магазинів: {len(data)}/{len(STORE_ORDER)}. "
+                    f"Відсутні: {', '.join(x for x in STORE_ORDER if x not in data) or 'немає'}. "
                     f"Курс {rate:g} грн/$. Автоматичні відправки не змінено."
         )
     except Exception as exc:
