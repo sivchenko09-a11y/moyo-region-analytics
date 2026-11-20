@@ -3784,10 +3784,34 @@ def mini_trend_report(store=None):
     if frame.empty:
         return f"⚪ За {day:%d.%m.%Y} немає даних для {store}."
     plans = load_monthly_plans(latest[:7])
+    # The same accounting rate used by the 1C interim report; never guess a rate.
+    rate = None
+    rate_date = None
+    for candidate in (datetime.now(REPORT_TZ).date(), day):
+        if candidate > datetime.now(REPORT_TZ).date():
+            continue
+        try:
+            rate, _, _ = fetch_interim_sheet(candidate, allow_partial=True)
+            rate_date = candidate
+            break
+        except (ValueError, KeyError, TypeError, OSError, RuntimeError) as exc:
+            log.info('Mini report: 1C rate unavailable for %s: %s', candidate, exc)
+        except Exception as exc:
+            log.warning('Mini report: cannot fetch 1C rate for %s: %s', candidate, exc)
+    def both(amount):
+        usd = fmt(amount)
+        if rate is None:
+            return usd + ' / курс грн недоступний'
+        return usd + ' / ' + f'{amount * rate:,.0f}'.replace(',', ' ') + ' грн'
+
     lines = [f"📍 МІНІЗВІТ — {store or 'РЕГІОН'}",
              f"📅 Дані станом на {day:%d.%m.%Y} (накопичувально)",
              f"Темп: {day.day} із {days} днів місяця.",
              "Розрив = сума, яку потрібно додати до поточного факту, щоб зараз іти за графіком на відповідний % місячного плану."]
+    if rate is not None:
+        lines.append(f'💱 Курс 1С: {rate:g} грн/$ (вкладка {rate_date:%d.%m.%Y})')
+    else:
+        lines.append('💱 Курс 1С недоступний — гривневі суми не розраховано.')
     for metric, label in (("sales", "💰 ОБОРОТ"), ("accessories", "🎧 АКСЕСУАРИ"), ("services", "🛠 ПОСЛУГИ")):
         col = "cumulative_" + metric
         if col not in frame or frame[col].isna().any():
@@ -3804,22 +3828,22 @@ def mini_trend_report(store=None):
                 targets.append(float(value))
         actual = float(frame[col].sum())
         if missing:
-            lines.extend(["", f"{label}: факт {fmt(actual)}; відсутній план: {', '.join(missing)}. Розрив не розраховано."])
+            lines.extend(["", f"{label}: факт {both(actual)}; відсутній план: {', '.join(missing)}. Розрив не розраховано."])
             continue
         plan = sum(targets)
         if plan <= 0:
             lines.extend(["", f"{label}: план відсутній або нульовий."])
             continue
         trend = actual * days / (day.day * plan) * 100
-        lines.extend(["", f"{label}", f"Факт: {fmt(actual)} | План: {fmt(plan)}", f"Поточний тренд: {trend:.1f}%"])
+        lines.extend(["", f"{label}", f"Факт: {both(actual)} | План: {both(plan)}", f"Поточний тренд: {trend:.1f}%"])
         for threshold in (95, 100, 110):
             pace = plan * (threshold / 100) * day.day / days
             deficit = max(0.0, pace - actual)
             surplus = max(0.0, actual - pace)
             if deficit > 0.005:
-                lines.append(f"До {threshold}%: бракує {fmt(deficit)}")
+                lines.append(f"До {threshold}%: бракує {both(deficit)}")
             else:
-                lines.append(f"До {threshold}%: розрив 0 $" + (f" (випередження {fmt(surplus)})" if surplus > 0.005 else ""))
+                lines.append(f"До {threshold}%: розрив {both(0)}" + (f" (випередження {both(surplus)})" if surplus > 0.005 else ""))
     lines.extend(["", "ℹ️ Це розрив до планового темпу на дату звіту, а не сума, яку треба продати до кінця місяця."])
     return "\n".join(lines)
 
