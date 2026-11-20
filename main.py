@@ -32,6 +32,10 @@ OWNER_ID = os.getenv("OWNER_ID")
 DB_PATH = os.getenv("DB_PATH", "/data/analytics.sqlite3")
 DATE_WAIT = 1
 
+# Automated Telegram group reports (Kyiv time).
+REPORT_TZ = ZoneInfo("Europe/Kyiv")
+GROUP_CHAT_ID = os.getenv("REPORT_GROUP_CHAT_ID", "").strip()
+
 STORE_ORDER = [
     "Буча-Рітейл Парк", "Київ-Аладдін", "Київ-Аркадія",
     "Київ-Блокбастер", "Київ-Дрімтаун_new", "Київ-Квадрат",
