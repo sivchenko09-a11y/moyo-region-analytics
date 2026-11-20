@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pandas as pd
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ConversationHandler, CallbackQueryHandler,
     ContextTypes, filters
@@ -3854,7 +3855,13 @@ async def mini_trend_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         store = STORE_ORDER[idx]
     try:
         report = await asyncio.to_thread(mini_trend_report, store)
-        await query.edit_message_text(report, reply_markup=mini_trend_keyboard())
+        try:
+            await query.edit_message_text(report, reply_markup=mini_trend_keyboard())
+        except BadRequest as exc:
+            # Telegram rejects a no-op edit when the same selection is pressed twice.
+            if "message is not modified" in str(exc).lower():
+                return
+            raise
     except Exception as exc:
         log.exception("Mini trend report failed: %s", exc)
         await query.message.reply_text(f"❌ Міні-звіт недоступний: {exc}")
