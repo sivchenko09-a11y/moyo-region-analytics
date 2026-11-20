@@ -3582,6 +3582,7 @@ async def setup_commands(app):
     await app.bot.set_my_commands([
         BotCommand("focus", "🎯 Фокуси + категорії"),
         BotCommand("wow", "8 показників: тиждень до тижня"),
+        BotCommand("mini", "Міні-звіт: тренд і розрив до 95/100/110%"),
         BotCommand("categories", "Категорії: ієрархія та порівняння"),
         BotCommand("direct_wow", "Вибір порівняння тиждень до тижня"),
         BotCommand("group_test", "Тест відправки у групу"),
@@ -3766,6 +3767,98 @@ def group_report_text(day):
         lines.extend(["", category, f"Факт: {focus_pair(data, category, unit, day, day)}"])
     return "\n".join(lines)
 
+
+
+# Private on-demand mini report: cumulative pace required for 95/100/110%.
+def mini_trend_report(store=None):
+    frames = daily_frames()
+    if not frames:
+        return "⚪ Немає завантажених звітів продажів. Онови дані через /sync."
+    latest = max(frames)
+    day = datetime.strptime(latest, "%Y-%m-%d").date()
+    days = calendar.monthrange(day.year, day.month)[1]
+    frame = frames[latest]
+    if store is not None:
+        frame = frame[frame.store == store]
+    if frame.empty:
+        return f"⚪ За {day:%d.%m.%Y} немає даних для {store}."
+    plans = load_monthly_plans(latest[:7])
+    lines = [f"📍 МІНІЗВІТ — {store or 'РЕГІОН'}",
+             f"📅 Дані станом на {day:%d.%m.%Y} (накопичувально)",
+             f"Темп: {day.day} із {days} днів місяця.",
+             "Розрив = сума, яку потрібно додати до поточного факту, щоб зараз іти за графіком на відповідний % місячного плану."]
+    for metric, label in (("sales", "💰 ОБОРОТ"), ("accessories", "🎧 АКСЕСУАРИ"), ("services", "🛠 ПОСЛУГИ")):
+        col = "cumulative_" + metric
+        if col not in frame or frame[col].isna().any():
+            lines.extend(["", f"{label}: немає повного факту."])
+            continue
+        missing, targets = [], []
+        for _, r in frame.iterrows():
+            value = plans.loc[r.store, metric] if r.store in plans.index and metric in plans.columns else None
+            if (value is None or pd.isna(value)) and metric == "sales":
+                value = r.get("plan")
+            if value is None or pd.isna(value):
+                missing.append(r.store)
+            else:
+                targets.append(float(value))
+        actual = float(frame[col].sum())
+        if missing:
+            lines.extend(["", f"{label}: факт {fmt(actual)}; відсутній план: {', '.join(missing)}. Розрив не розраховано."])
+            continue
+        plan = sum(targets)
+        if plan <= 0:
+            lines.extend(["", f"{label}: план відсутній або нульовий."])
+            continue
+        trend = actual * days / (day.day * plan) * 100
+        lines.extend(["", f"{label}", f"Факт: {fmt(actual)} | План: {fmt(plan)}", f"Поточний тренд: {trend:.1f}%"])
+        for threshold in (95, 100, 110):
+            pace = plan * (threshold / 100) * day.day / days
+            deficit = max(0.0, pace - actual)
+            surplus = max(0.0, actual - pace)
+            if deficit > 0.005:
+                lines.append(f"До {threshold}%: бракує {fmt(deficit)}")
+            else:
+                lines.append(f"До {threshold}%: розрив 0 $" + (f" (випередження {fmt(surplus)})" if surplus > 0.005 else ""))
+    lines.extend(["", "ℹ️ Це розрив до планового темпу на дату звіту, а не сума, яку треба продати до кінця місяця."])
+    return "\n".join(lines)
+
+
+def mini_trend_keyboard():
+    stores = STORE_ORDER
+    buttons = [[InlineKeyboardButton("🌐 Увесь регіон", callback_data="mini:all")]]
+    for i in range(0, len(stores), 2):
+        buttons.append([InlineKeyboardButton(stores[j].replace("Київ-", ""), callback_data=f"mini:{j}") for j in range(i, min(i+2, len(stores)))])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def mini_trend_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await update.message.reply_text("Цей звіт доступний лише власнику бота.")
+        return
+    await update.message.reply_text(mini_trend_report(), reply_markup=mini_trend_keyboard())
+
+
+async def mini_trend_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_owner(update):
+        await query.answer("Доступ заборонено", show_alert=True)
+        return
+    await query.answer()
+    key = query.data.split(":", 1)[1]
+    if key == "all":
+        store = None
+    else:
+        idx = int(key)
+        if idx < 0 or idx >= len(STORE_ORDER):
+            return
+        store = STORE_ORDER[idx]
+    try:
+        report = await asyncio.to_thread(mini_trend_report, store)
+        await query.edit_message_text(report, reply_markup=mini_trend_keyboard())
+    except Exception as exc:
+        log.exception("Mini trend report failed: %s", exc)
+        await query.message.reply_text(f"❌ Міні-звіт недоступний: {exc}")
+
 def main():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN environment variable is missing")
@@ -3782,6 +3875,8 @@ def main():
     app.add_handler(CommandHandler("categories", categories_cmd))
     app.add_handler(CommandHandler("forecast", forecast_cmd))
     app.add_handler(CallbackQueryHandler(categories_callback, pattern=r"^cat:(store|source|cat|page|back|report|period|periodpick|periodpage|periodback|forecast):"))
+    app.add_handler(CommandHandler("mini", mini_trend_cmd))
+    app.add_handler(CallbackQueryHandler(mini_trend_choice, pattern=r"^mini:(all|[0-9]+)$"))
     app.add_handler(CommandHandler("wow", wow_menu))
     app.add_handler(CommandHandler("direct_wow", wow_menu))
     app.add_handler(CallbackQueryHandler(wow_choice, pattern=r"^(wm:(services|accessories|direct|sales|pickup|conversion|ktc|average)|ws:(all|back|[0-9]+))$"))
