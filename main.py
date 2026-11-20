@@ -2527,7 +2527,7 @@ def interim_watch_db():
 
 
 async def interim_loop(app):
-    """Publish each stable changed 1C snapshot; persist baseline across Railway restarts."""
+    """Send the first valid daily 1C upload and each stable changed snapshot once."""
     pending = None
     while True:
         await asyncio.sleep(60)
@@ -2542,47 +2542,41 @@ async def interim_loop(app):
             conn = interim_watch_db()
             try:
                 saved = conn.execute(
-                    'SELECT signature FROM interim_watch_state WHERE chat_id=? AND day=?',
+                    'SELECT signature, sent_at FROM interim_watch_state WHERE chat_id=? AND day=?',
                     (chat_key, day_key)).fetchone()
-                if saved is None:
-                    # Initial observation is not evidence of a new upload.
-                    # Persist it so that a subsequent restart cannot reset the baseline.
-                    with conn:
-                        conn.execute('INSERT INTO interim_watch_state (chat_id,day,signature) VALUES (?,?,?)',
-                                     (chat_key, day_key, signature))
-                    pending = None
-                    log.info('Interim baseline persisted for %s; waiting for changed 1C figures', day_key)
-                    continue
             finally:
                 conn.close()
-            if saved[0] == signature:
+            # A baseline without sent_at is NOT a delivered report. This also
+            # migrates today's baseline created by older versions of the bot.
+            if saved is not None and saved[1] and saved[0] == signature:
                 pending = None
                 continue
             key = (day_key, signature)
             if pending is None or pending[0] != key:
                 pending = (key, now)
-                continue  # Require two consecutive identical snapshots.
+                continue  # Verify identical complete data on the next poll.
             detected_at = pending[1]
             await asyncio.to_thread(refresh_interim_plans, day)
             picture = await asyncio.to_thread(interim_dashboard, day, now.hour, rate, data, detected_at, True)
-            sent_at = datetime.now(REPORT_TZ)
             await app.bot.send_photo(
                 chat_id=int(GROUP_CHAT_ID), photo=picture,
                 caption=(f'📊 МОЙО ЦЕНТР | ПРОМІЖКОВИЙ ЗВІТ\n'
                          f'🕒 Актуально на {detected_at:%H:%M}'))
+            sent_at = datetime.now(REPORT_TZ)
             conn = interim_watch_db()
             try:
                 with conn:
-                    conn.execute('UPDATE interim_watch_state SET signature=?,detected_at=?,sent_at=? '
-                                 'WHERE chat_id=? AND day=?',
-                                 (signature, detected_at.isoformat(), sent_at.isoformat(), chat_key, day_key))
+                    conn.execute(
+                        'INSERT INTO interim_watch_state (chat_id,day,signature,detected_at,sent_at) '
+                        'VALUES (?,?,?,?,?) ON CONFLICT(chat_id,day) DO UPDATE SET '
+                        'signature=excluded.signature,detected_at=excluded.detected_at,sent_at=excluded.sent_at',
+                        (chat_key, day_key, signature, detected_at.isoformat(), sent_at.isoformat()))
             finally:
                 conn.close()
             log.info('Interim report delivered for %s; change detected at %s', day_key, detected_at.isoformat())
             pending = None
         except Exception:
             log.exception('Interim report poll failed; will retry')
-
 
 
 # Private-only interactive preview. Does not touch scheduled-send state.
