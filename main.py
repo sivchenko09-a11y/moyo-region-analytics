@@ -1217,7 +1217,8 @@ FOCUS_SHEET_ID = "1oGoXLgzy7sIp7tqg2oiziix3ImYZaFuyBnC-3CqfJ5Q"
 # Accepted headers prevent copied historical blocks of unrelated products being imported.
 FOCUS_CONFIG = {
     "ЕЗ": ("ЕЗ", "шт.", {"ез"}),
-    "Клімат": ("Клімат", "шт.", {"клімат"}),
+    "ТВ": ("ТВ", "шт.", {"тв", "телевізори", "телевізор"}),
+    "Монітори": ("Монітори", "шт.", {"монітори", "монітор"}),
     "Скріни": ("Скріни", "шт.", {"скрін"}),
     "Вуха1": ("Вуха", "шт.", {"вуха"}),
     "Павери": ("Павери", "шт.", {"павери"}),
@@ -1308,9 +1309,9 @@ def parse_focus_sheets(sheets):
                         if amount_identity in result:
                             raise ValueError(f"Фокуси: повтор суми {category} за {date}.")
                         result[amount_identity] = (date, category + " · сума", "грн", amount)
-    missing = set(FOCUS_CONFIG) - found
-    if missing:
-        raise ValueError("Фокуси: не знайдено вкладки: " + ", ".join(sorted(missing)))
+    # Removed/renamed optional tabs must not stop the whole sync.
+    if "ЕЗ" not in found:
+        raise ValueError("Фокуси: не знайдено вкладку ЕЗ (потрібна для визначення останньої дати).")
     anchor = [date for category, date in result if category == "ЕЗ"]
     if not anchor:
         raise ValueError("Фокуси: немає заповнених днів ЕЗ для визначення останньої дати.")
@@ -1935,7 +1936,7 @@ def digest_dashboard(day):
         txt(505,y,'Факт: '+money(actual)+' $' if actual is not None else 'Факт: —',19,navy)
         txt(910,y,'Прогноз: '+money(forecast)+' $' if forecast is not None else 'Прогноз: —',19,navy)
     txt(42,2042,'ФОКУСИ ЗА ДЕНЬ:',19,navy,True)
-    for i,category in enumerate(('ЕЗ','Клімат')):
+    for i,category in enumerate(('ЕЗ','ТВ')):
         unit=FOCUS_CONFIG[category][1]
         txt(330+i*650,2042,category+': '+focus_pair(focus,category,unit,day,day),19,navy,True)
     buf=io.BytesIO()
@@ -3761,9 +3762,9 @@ def group_report_text(day):
     data = focus_data()
     if not data or not any(d == key for _, d in data):
         raise ValueError(f"Немає фокусів за {day:%d.%m.%Y}.")
-    # Group digest: only daily ЕЗ and Клімат facts; /focus is unchanged.
-    lines.extend(["", "🎯 ФОКУСИ ЗА ВЧОРА — ЕЗ / КЛІМАТ"])
-    for category in ("ЕЗ", "Клімат"):
+    # Group digest: daily ЕЗ and ТВ facts; /focus is unchanged.
+    lines.extend(["", "🎯 ФОКУСИ ЗА ВЧОРА — ЕЗ / ТВ"])
+    for category in ("ЕЗ", "ТВ"):
         unit = FOCUS_CONFIG[category][1]
         lines.extend(["", category, f"Факт: {focus_pair(data, category, unit, day, day)}"])
     return "\n".join(lines)
