@@ -1807,7 +1807,7 @@ def digest_dashboard(day):
 
     # The same 1700px visual language and dense plan/fact/%/share table as 1C.
     from matplotlib import font_manager
-    W, H = 1700, 2110
+    W, H = 1700, 2150
     im = Image.new('RGB', (W,H), '#e7f2ff')
     d = ImageDraw.Draw(im)
     regular = font_manager.findfont(font_manager.FontProperties(family='DejaVu Sans'))
@@ -1927,7 +1927,7 @@ def digest_dashboard(day):
             txt(x,y,f'{i+1}. {short.get(store,store)}',20,navy,True)
             txt(x+530,y,pct(pc),21,color(pc),True)
             txt(x+745,y,money(actual)+' $',21,navy,True,'ra')
-    rect(14,1832,1686,2080,'white',20)
+    rect(14,1832,1686,2128,'white',20)
     txt(36,1846,'МІСЯЧНИЙ ТРЕНД РЕГІОНУ',27,navy,True)
     for i,(label,value,actual,forecast) in enumerate(trends):
         y=1901+i*43
@@ -1935,10 +1935,14 @@ def digest_dashboard(day):
         txt(295,y,pct(value),23,color(value),True)
         txt(505,y,'Факт: '+money(actual)+' $' if actual is not None else 'Факт: —',19,navy)
         txt(910,y,'Прогноз: '+money(forecast)+' $' if forecast is not None else 'Прогноз: —',19,navy)
-    txt(42,2042,'ФОКУСИ ЗА ДЕНЬ:',19,navy,True)
-    for i,category in enumerate(('ЕЗ','ТВ')):
+    txt(42,2014,'ФОКУСИ ЗА ДЕНЬ:',19,navy,True)
+    # Four focus categories in a 2x2 grid, each with quantity and UAH amount.
+    # Missing values are displayed explicitly rather than converted to zero.
+    for i,category in enumerate(('ЕЗ','ТВ','PlayStation','Монітори')):
         unit=FOCUS_CONFIG[category][1]
-        txt(330+i*650,2042,category+': '+focus_pair(focus,category,unit,day,day),19,navy,True)
+        x=42 if i%2==0 else 860
+        y=2044+(i//2)*42
+        txt(x,y,category+': '+focus_pair(focus,category,unit,day,day),19,navy,True)
     buf=io.BytesIO()
     im.save(buf,format='PNG',optimize=True)
     buf.seek(0); buf.name='moyo_daily_unified.png'
