@@ -2585,6 +2585,83 @@ async def interim_loop(app):
             log.exception('Interim report poll failed; will retry')
 
 
+# Year-over-year turnover: cumulative sales and same-day differences from Power BI PY.
+def turnover_yoy_report(report_day=None):
+    frames = daily_frames()
+    if not frames:
+        raise ValueError('Немає даних продажів. Виконай /sync.')
+    day_key = report_day.isoformat() if report_day else max(frames)
+    if day_key not in frames:
+        raise ValueError('Немає звіту за ' + day_key)
+    day = datetime.strptime(day_key, '%Y-%m-%d').date()
+    current = frames[day_key]
+    required = {'store', 'cumulative_sales', 'cumulative_py'}
+    if not required.issubset(current.columns):
+        raise ValueError('У звіті бракує обороту або ПродажиPY.')
+    current = current[current.store.isin(STORE_ORDER)].copy()
+    if set(current.store) != set(STORE_ORDER) or current[list(required - {'store'})].isna().any().any():
+        raise ValueError('Неповні накопичувальні дані за ' + day_key)
+    def n(v):
+        return f'{v:,.0f}'.replace(',', ' ')
+    def diff(old, new):
+        change = new-old
+        symbol = '🟢' if change>0 else '🔴' if change<0 else '⚪'
+        sign = '+' if change>0 else ''
+        percent = f'{sign}{change/old*100:.1f}%' if old else ('0.0%' if new==0 else 'н/д (база 0)')
+        return f'{symbol} {sign}{n(change)} $ ({percent})'
+    old = float(current.cumulative_py.sum())
+    new = float(current.cumulative_sales.sum())
+    lines = [
+        '📊 МОЙО | ОБОРОТ РІК ДО РОКУ',
+        f'📅 01–{day:%d.%m.%Y} проти 01–{day.day:02d}.{day.month:02d}.{day.year-1}',
+        '', f'2025: {n(old)} $', f'2026: {n(new)} $',
+        'Зміна: '+diff(old,new), '', '🏬 ПО МАГАЗИНАХ (2025 → 2026):'
+    ]
+    rows=[]
+    for _,r in current.iterrows():
+        a=float(r.cumulative_py); b=float(r.cumulative_sales)
+        rows.append((str(r.store),a,b,b-a))
+    for name,a,b,change in sorted(rows,key=lambda x:x[3]):
+        lines.append(f'{html.escape(name.replace("Київ-", ""))}: {n(a)} → {n(b)} $ | {diff(a,b)}')
+    lines.extend(['', '📉 НАЙБІЛЬШЕ ПАДІННЯ:'])
+    for name,a,b,change in sorted(rows,key=lambda x:x[3])[:3]:
+        lines.append(f'• {html.escape(name.replace("Київ-", ""))}: {diff(a,b)}')
+    lines.append('📈 НАЙБІЛЬШЕ ЗРОСТАННЯ:')
+    for name,a,b,change in sorted(rows,key=lambda x:x[3],reverse=True)[:3]:
+        lines.append(f'• {html.escape(name.replace("Київ-", ""))}: {diff(a,b)}')
+    if day.day>1:
+        previous_key=(day-timedelta(days=1)).isoformat()
+        previous=frames.get(previous_key)
+        if previous is not None and {'store','cumulative_sales','cumulative_py'}.issubset(previous.columns):
+            previous=previous[previous.store.isin(STORE_ORDER)]
+            if set(previous.store)==set(STORE_ORDER) and not previous[['cumulative_sales','cumulative_py']].isna().any().any():
+                yesterday_old=old-float(previous.cumulative_py.sum())
+                yesterday_new=new-float(previous.cumulative_sales.sum())
+                lines.extend(['', f'📆 ЛИШЕ ЗА {day:%d.%m}:',
+                              f'{day.year-1}: {n(yesterday_old)} $ | {day.year}: {n(yesterday_new)} $',
+                              'Зміна: '+diff(yesterday_old,yesterday_new)])
+            else:
+                lines.extend(['', 'Денне порівняння недоступне: неповний попередній зріз.'])
+        else:
+            lines.extend(['', 'Денне порівняння недоступне: немає попереднього накопичувального зрізу.'])
+    lines.extend(['', 'Джерело: накопичувальні Продажи та ПродажиPY з Power BI.'])
+    return '\n'.join(lines)
+
+
+async def yoy_cmd(update, context):
+    if not is_owner(update):
+        return
+    try:
+        day=None
+        if context.args:
+            day=datetime.strptime(context.args[0], '%d.%m.%Y').date()
+        report=await asyncio.to_thread(turnover_yoy_report, day)
+        for start in range(0,len(report),3500):
+            await update.effective_message.reply_text(report[start:start+3500])
+    except (ValueError, IndexError) as exc:
+        await update.effective_message.reply_text('❌ '+str(exc)+'\nПриклад: /yoy 21.11.2026')
+
+
 # Private-only interactive preview. Does not touch scheduled-send state.
 async def private_test_menu(update, context):
     if not is_owner(update):
@@ -2595,6 +2672,7 @@ async def private_test_menu(update, context):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 За минулий день", callback_data="private_test:day")],
         [InlineKeyboardButton("📈 Місячний тренд", callback_data="private_test:month")],
+        [InlineKeyboardButton("📊 Оборот рік до року", callback_data="private_test:yoy")],
         [InlineKeyboardButton("📅 Тижневий звіт", callback_data="private_test:week")],
         [InlineKeyboardButton("📊 Проміжковий звіт 1С", callback_data="private_test:interim")],
     ])
@@ -2624,7 +2702,7 @@ async def private_test_selected(update, context):
         await query.answer("Тест доступний лише в особистому чаті.", show_alert=True)
         return
     kind = query.data.split(":", 1)[1]
-    if kind not in ("day", "month", "week", "interim"):
+    if kind not in ("day", "month", "week", "interim", "yoy"):
         await query.answer("Невідомий звіт.", show_alert=True)
         return
     await query.answer()
@@ -2633,6 +2711,11 @@ async def private_test_selected(update, context):
     yesterday = today - timedelta(days=1)
     try:
         await context.bot.send_message(chat_id=chat_id, text="🔄 Формую тестовий звіт…")
+        if kind == "yoy":
+            report = await asyncio.to_thread(turnover_yoy_report, yesterday)
+            for start in range(0, len(report), 3500):
+                await context.bot.send_message(chat_id=chat_id, text=report[start:start+3500])
+            return
         if kind == "day":
             picture = await asyncio.to_thread(digest_dashboard, yesterday)
             caption = f"🧪 ТЕСТ • МОЙО — за минулий день ({yesterday:%d.%m.%Y})"
@@ -3916,6 +3999,7 @@ def main():
     app.add_handler(CommandHandler("wow", wow_menu))
     app.add_handler(CommandHandler("direct_wow", wow_menu))
     app.add_handler(CallbackQueryHandler(wow_choice, pattern=r"^(wm:(services|accessories|direct|sales|pickup|conversion|ktc|average)|ws:(all|back|[0-9]+))$"))
+    app.add_handler(CommandHandler("yoy", yoy_cmd))
     app.add_handler(CommandHandler("test", private_test_menu))
     app.add_handler(CallbackQueryHandler(private_test_selected, pattern=r"^private_test:(day|month|week|interim)$"))
     app.add_handler(CommandHandler("group_here", group_here))
