@@ -1630,12 +1630,7 @@ async def sync_cmd(update, context):
         except ValueError as exc:
             result += "\nФокуси не оновлено: " + str(exc)
         except Exception as exc:
-           log.error(
-    "Focus sync failed: %s | HTTP status: %s",
-    type(exc).__name__,
-    getattr(getattr(exc, "response", None), "status_code", None)
-)
-        
+            log.error("Focus sync failed: %s | HTTP status: %s", type(exc).__name__, getattr(getattr(exc, "response", None), "status_code", None))
             result += "\nФокуси не оновлено. Перевір доступ службового акаунта до таблиці Фокуси + категорії. Попередні дані фокусів збережені."
     except ImportError:
         result = "Додай google-auth[requests]>=2,<3 до requirements.txt та онови Railway."
