@@ -2,6 +2,9 @@ import html
 import os
 import math
 import asyncio
+import threading
+import time
+import random
 import json
 from types import SimpleNamespace
 import calendar
@@ -1109,14 +1112,61 @@ def sheet_dates(metadata):
     return dates
 
 
+# Serialize Google Sheets requests across manual and scheduled jobs.
+_google_request_lock = threading.Lock()
+
+def google_get(session, url, **kwargs):
+    import requests
+    with _google_request_lock:
+        for attempt in range(6):
+            try:
+                response = session.get(url, **kwargs)
+                if response.status_code not in (429, 500, 502, 503, 504):
+                    return response
+                if attempt == 5:
+                    response.raise_for_status()
+                delay = min(60, 2 ** (attempt + 1)) + random.random()
+                try:
+                    delay = max(delay, float(response.headers.get('Retry-After', 0)))
+                except ValueError:
+                    pass
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+                if attempt == 5:
+                    raise
+                delay = min(60, 2 ** (attempt + 1)) + random.random()
+            log.warning('Google request retry %s/5 in %.1fs', attempt + 1, delay)
+            time.sleep(delay)
+
+
+def google_batch(session, sheet_id, ranges):
+    result = []
+    for start in range(0, len(ranges), 40):
+        chunk = ranges[start:start+40]
+        response = google_get(session, f'https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values:batchGet',
+                              params={'ranges': chunk, 'valueRenderOption': 'UNFORMATTED_VALUE', 'dateTimeRenderOption': 'SERIAL_NUMBER'}, timeout=90)
+        response.raise_for_status()
+        values = response.json().get('valueRanges', [])
+        if len(values) != len(chunk):
+            raise ValueError('Google Sheets: неповна відповідь batchGet.')
+        result.extend(v.get('values', []) for v in values)
+    return result
+
+
+def sheet_range(title):
+    return "'" + title.replace("'", "''") + "'"
+
+
 def google_table(session, sheet_id, title):
     from urllib.parse import quote
     escaped = "'" + title.replace("'", "''") + "'"
-    response = session.get(
+    response = google_get(session, 
         f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{quote(escaped, safe='')}",
         params={"valueRenderOption": "UNFORMATTED_VALUE"}, timeout=45)
     response.raise_for_status()
-    rows = response.json().get("values", [])
+    return google_rows(response.json().get("values", []), title)
+
+
+def google_rows(rows, title):
     for index, row in enumerate(rows):
         if "Склад" in [str(value).strip() for value in row]:
             header = [str(value).strip() for value in row]
@@ -1128,7 +1178,7 @@ def google_table(session, sheet_id, title):
 
 
 def fetch_monthly_plans(session, only_month=None):
-    response = session.get(f"https://sheets.googleapis.com/v4/spreadsheets/{PLANS_SHEET_ID}",
+    response = google_get(session, f"https://sheets.googleapis.com/v4/spreadsheets/{PLANS_SHEET_ID}",
                            params={"fields": "sheets.properties.title"}, timeout=45)
     response.raise_for_status()
     months = {}
@@ -1161,7 +1211,13 @@ def fetch_monthly_plans(session, only_month=None):
     return records
 
 
+_lock_sync_google_sheets = threading.Lock()
+
 def sync_google_sheets():
+    with _lock_sync_google_sheets:
+        return _sync_google_sheets()
+
+def _sync_google_sheets():
     from google.oauth2.service_account import Credentials
     from google.auth.transport.requests import AuthorizedSession
     config = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -1171,7 +1227,7 @@ def sync_google_sheets():
     with AuthorizedSession(credentials) as session:
         calendars = []
         for sheet_id in (SALES_SHEET_ID, QUALITY_SHEET_ID):
-            response = session.get(f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}",
+            response = google_get(session, f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}",
                                    params={"fields": "sheets.properties.title"}, timeout=45)
             response.raise_for_status()
             metadata = response.json()
@@ -1182,9 +1238,11 @@ def sync_google_sheets():
             raise ValueError("Немає спільних дат. Назви вкладки в обох таблицях однаково, наприклад 01.11.2026.")
         plans = fetch_monthly_plans(session)
         prepared = []
-        for day in common:
-            sales = google_table(session, SALES_SHEET_ID, sales_dates[day])
-            quality = google_table(session, QUALITY_SHEET_ID, quality_dates[day])
+        sales_rows = google_batch(session, SALES_SHEET_ID, [sheet_range(sales_dates[d]) for d in common])
+        quality_rows = google_batch(session, QUALITY_SHEET_ID, [sheet_range(quality_dates[d]) for d in common])
+        for day, sr, qr in zip(common, sales_rows, quality_rows):
+            sales = google_rows(sr, sales_dates[day])
+            quality = google_rows(qr, quality_dates[day])
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
                 sales.to_excel(writer, sheet_name="Продажі", index=False)
@@ -1327,7 +1385,13 @@ def focus_db():
     return conn
 
 
+_lock_sync_focus_google = threading.Lock()
+
 def sync_focus_google():
+    with _lock_sync_focus_google:
+        return _sync_focus_google()
+
+def _sync_focus_google():
     from google.oauth2.service_account import Credentials
     from google.auth.transport.requests import AuthorizedSession
     from urllib.parse import quote
@@ -1336,7 +1400,7 @@ def sync_focus_google():
         raise ValueError("Додай GOOGLE_SERVICE_ACCOUNT_JSON у Railway.")
     creds = Credentials.from_service_account_info(json.loads(config), scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
     with AuthorizedSession(creds) as session:
-        response = session.get(f"https://sheets.googleapis.com/v4/spreadsheets/{FOCUS_SHEET_ID}", params={"fields": "sheets.properties.title"}, timeout=45)
+        response = google_get(session, f"https://sheets.googleapis.com/v4/spreadsheets/{FOCUS_SHEET_ID}", params={"fields": "sheets.properties.title"}, timeout=45)
         response.raise_for_status()
         sheets = {}
         for item in response.json().get("sheets", []):
@@ -1345,11 +1409,10 @@ def sync_focus_google():
                 continue
             if any(t.strip() == title.strip() for t in sheets):
                 raise ValueError(f"Фокуси: дубль вкладки {title}.")
-            address = "'" + title.replace("'", "''") + "'!A1:ZZ40"
-            response = session.get(f"https://sheets.googleapis.com/v4/spreadsheets/{FOCUS_SHEET_ID}/values/{quote(address, safe='')}",
-                                   params={"valueRenderOption": "UNFORMATTED_VALUE", "dateTimeRenderOption": "SERIAL_NUMBER"}, timeout=45)
-            response.raise_for_status()
-            sheets[title] = response.json().get("values", [])
+            sheets[title] = []
+        titles = list(sheets)
+        rows = google_batch(session, FOCUS_SHEET_ID, [sheet_range(t) + '!A1:ZZ40' for t in titles])
+        sheets = dict(zip(titles, rows))
     records, cutoff = parse_focus_sheets(sheets)
     conn = focus_db()
     try:
@@ -1631,7 +1694,7 @@ async def sync_cmd(update, context):
             result += "\nФокуси не оновлено: " + str(exc)
         except Exception as exc:
             log.error("Focus sync failed: %s | HTTP status: %s", type(exc).__name__, getattr(getattr(exc, "response", None), "status_code", None))
-            result += "\nФокуси не оновлено. Перевір доступ службового акаунта до таблиці Фокуси + категорії. Попередні дані фокусів збережені."
+            result += "\nФокуси не оновлено. Google Sheets тимчасово недоступний або повернув помилку. Попередні дані фокусів збережені."
     except ImportError:
         result = "Додай google-auth[requests]>=2,<3 до requirements.txt та онови Railway."
     except ValueError as exc:
@@ -1803,7 +1866,7 @@ def digest_dashboard(day):
         trends.append((label,percentage(forecast,goal),actual,forecast))
     focus=focus_data()
     if not any(k[1]==key for k in focus):
-        raise ValueError('Немає фокусів за звітний день')
+        log.warning('No focus data for %s; rendering available metrics', key)
 
     # The same 1700px visual language and dense plan/fact/%/share table as 1C.
     from matplotlib import font_manager
@@ -2185,6 +2248,13 @@ async def group_here(update, context):
         "Після перезапуску бот відправлятиме звіт щодня о 12:00 за Києвом."
     )
 
+async def refresh_focus_optional():
+    try:
+        await asyncio.to_thread(sync_focus_google)
+    except Exception as exc:
+        log.warning('Focus refresh unavailable: %s | HTTP status: %s', type(exc).__name__, getattr(getattr(exc, 'response', None), 'status_code', None))
+
+
 async def group_test(update, context):
     if not is_owner(update):
         return
@@ -2197,7 +2267,7 @@ async def group_test(update, context):
     try:
         await context.bot.send_message(chat_id=update.effective_chat.id, text="🔄 Оновлюю продажі, плани та фокуси з Google Sheets перед тестом…")
         await asyncio.to_thread(sync_google_sheets)
-        await asyncio.to_thread(sync_focus_google)
+        await refresh_focus_optional()
         await send_digest(context.bot, chat_id, day, force=True)
         await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Тестовий звіт за {day:%d.%m.%Y} надіслано.")
     except Exception as exc:
@@ -2224,7 +2294,7 @@ async def digest_loop(app):
         try:
             # Refresh both sources before sending, avoid stale data.
             await asyncio.to_thread(sync_google_sheets)
-            await asyncio.to_thread(sync_focus_google)
+            await refresh_focus_optional()
             await send_digest(app.bot, GROUP_CHAT_ID, day)
         except Exception:
             log.exception("Scheduled group digest failed; will not send incomplete report")
@@ -2241,7 +2311,7 @@ async def automatic_startup_test(app):
     try:
         day = datetime.now(REPORT_TZ).date() - timedelta(days=1)
         await asyncio.to_thread(sync_google_sheets)
-        await asyncio.to_thread(sync_focus_google)
+        await refresh_focus_optional()
         await send_digest(app.bot, GROUP_CHAT_ID, day, force=True)
         log.info("AUTO TEST SUCCESS: photo sent to group %s for %s", GROUP_CHAT_ID, day)
     except Exception:
@@ -2303,14 +2373,14 @@ def fetch_interim_sheet(report_day, allow_partial=False):
         raise ValueError('Немає GOOGLE_SERVICE_ACCOUNT_JSON у Railway.')
     credentials = Credentials.from_service_account_info(json.loads(config), scopes=['https://www.googleapis.com/auth/spreadsheets.readonly'])
     with AuthorizedSession(credentials) as session:
-        metadata = session.get(f'https://sheets.googleapis.com/v4/spreadsheets/{INTERIM_SHEET_ID}',
+        metadata = google_get(session, f'https://sheets.googleapis.com/v4/spreadsheets/{INTERIM_SHEET_ID}',
                                params={'fields':'sheets.properties.title'},timeout=45)
         metadata.raise_for_status()
         title = sheet_dates(metadata.json()).get(report_day.isoformat())
         if not title:
             raise ValueError(f'Немає вкладки {report_day:%d.%m.%Y} у проміжковій таблиці.')
         address = quote("'" + title.replace("'", "''") + "'", safe='')
-        response = session.get(f'https://sheets.googleapis.com/v4/spreadsheets/{INTERIM_SHEET_ID}/values/{address}',
+        response = google_get(session, f'https://sheets.googleapis.com/v4/spreadsheets/{INTERIM_SHEET_ID}/values/{address}',
                                params={'valueRenderOption':'FORMATTED_VALUE'},timeout=45)
         response.raise_for_status()
         return parse_interim_rows(response.json().get('values', []), report_day, allow_partial=allow_partial)
@@ -2752,14 +2822,33 @@ async def private_test_selected(update, context):
         log.exception("Private test %s failed", kind)
         await context.bot.send_message(chat_id=chat_id, text=f"❌ Не вдалося сформувати звіт: {exc}")
 
+def schedule_background(app, coro, name):
+    async def runner():
+        try:
+            while not app.running:
+                await asyncio.sleep(0.1)
+            await coro
+        finally:
+            coro.close()
+    task = asyncio.create_task(runner(), name=name)
+    app.bot_data.setdefault('_background_tasks', []).append(task)
+
+
+async def stop_background(app):
+    tasks = app.bot_data.pop('_background_tasks', [])
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def setup_group_schedule(app):
     await setup_commands(app)
-    app.create_task(digest_loop(app), name="group-digest-12-kyiv")
+    schedule_background(app, digest_loop(app), name="group-digest-12-kyiv")
     if os.getenv("AUTO_TEST_ON_START", "").strip() == "1":
-        app.create_task(automatic_startup_test(app), name="automatic-startup-test-5min")
-    app.create_task(extra_digest_loop(app,"week"), name="weekly-digest-kyiv")
-    app.create_task(extra_digest_loop(app,"month"), name="monthly-trend-kyiv")
-    app.create_task(interim_loop(app), name="interim-sales-watch-kyiv")
+        schedule_background(app, automatic_startup_test(app), name="automatic-startup-test-5min")
+    schedule_background(app, extra_digest_loop(app,"week"), name="weekly-digest-kyiv")
+    schedule_background(app, extra_digest_loop(app,"month"), name="monthly-trend-kyiv")
+    schedule_background(app, interim_loop(app), name="interim-sales-watch-kyiv")
 
 
 # Category analytics extension: quarterly Power BI pivot import and navigation
@@ -3508,7 +3597,7 @@ def fetch_category_google_xlsx():
                 json.loads(config),
                 scopes=["https://www.googleapis.com/auth/drive.readonly"])
             with AuthorizedSession(credentials) as session:
-                response = session.get(
+                response = google_get(session, 
                     f"https://www.googleapis.com/drive/v3/files/{CATEGORY_SHEET_ID}/export",
                     params={"mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
                     timeout=120)
@@ -3589,7 +3678,7 @@ async def categories_auto_loop(app):
 _old_setup_group_schedule = setup_group_schedule
 async def setup_group_schedule(app):
     await _old_setup_group_schedule(app)
-    app.create_task(categories_auto_loop(app),name="categories-google-refresh")
+    schedule_background(app, categories_auto_loop(app),name="categories-google-refresh")
 
 
 # Restored handlers from original working main(8).py
@@ -3983,7 +4072,7 @@ def main():
         raise RuntimeError("BOT_TOKEN environment variable is missing")
     if not OWNER_ID:
         raise RuntimeError("OWNER_ID environment variable is missing")
-    app = Application.builder().token(TOKEN).post_init(setup_group_schedule).build()
+    app = Application.builder().token(TOKEN).post_init(setup_group_schedule).post_stop(stop_background).build()
     conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Document.ALL, handle_document)],
         states={DATE_WAIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, date_received)]},
